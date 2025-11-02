@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[command(about = "A blazingly fast disk usage analyzer TUI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 
     /// Path to database file
     #[arg(short, long, default_value = "~/.config/rootkitty/rootkitty.db")]
@@ -30,6 +30,8 @@ enum Commands {
         /// Path to scan
         path: PathBuf,
     },
+    /// Run a demo scan (simulated, no real filesystem access)
+    DemoScan,
     /// Launch the interactive TUI
     Browse,
     /// List all scans
@@ -58,7 +60,101 @@ async fn main() -> Result<()> {
         .context("Failed to open database")?;
 
     match cli.command {
-        Commands::Scan { path } => {
+        None => {
+            // Default to TUI if no command provided
+            let mut app = App::new(db);
+            app.run().await?;
+        }
+        Some(Commands::DemoScan) => {
+            println!("Running demo scan (in-memory database)...");
+            // Use in-memory database for demo
+            let demo_db = Database::new(":memory:").await?;
+            let demo_path = PathBuf::from("/demo");
+            let scan_id = demo_db.create_scan(&demo_path).await?;
+
+            // Create channel for streaming entries to database actor
+            let (tx, rx) = mpsc::channel(100);
+
+            // Create channel for progress updates
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+
+            // Spawn database actor to handle inserts
+            let actor = DatabaseActor::new(demo_db.clone(), scan_id, rx);
+            let actor_handle = tokio::spawn(async move { actor.run().await });
+
+            // Spawn progress monitor task
+            let progress_handle = tokio::spawn(async move {
+                while let Some(progress) = progress_rx.recv().await {
+                    // Clear previous output (up to 5 lines)
+                    print!("\r\x1B[J"); // Clear from cursor to end of screen
+
+                    // Show summary line
+                    print!("Progress: {} entries scanned", progress.files_scanned);
+
+                    if progress.active_workers > 0 {
+                        print!(" | {} parallel workers", progress.active_workers);
+                    }
+                    println!();
+
+                    // Show active directories (limit to top 4 for readability)
+                    let max_display = 4;
+                    for (_idx, (dir_path, done, total)) in
+                        progress.active_dirs.iter().take(max_display).enumerate()
+                    {
+                        let percentage = if *total > 0 {
+                            (*done as f64 / *total as f64 * 100.0) as usize
+                        } else {
+                            0
+                        };
+
+                        // Show intelligently truncated path
+                        let display_path = smart_truncate_path(dir_path, 70);
+
+                        println!("  [{}/{}] {:>3}% {}", done, total, percentage, display_path);
+                    }
+
+                    if progress.active_dirs.len() > max_display {
+                        println!(
+                            "  ... and {} more directories",
+                            progress.active_dirs.len() - max_display
+                        );
+                    }
+
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
+            });
+
+            // Run demo scan (runs in blocking thread)
+            let tx_clone = tx.clone();
+            let scan_result = tokio::task::spawn_blocking(move || {
+                let scanner = Scanner::with_sender_demo(&demo_path, tx_clone, Some(progress_tx));
+                scanner.scan()
+            })
+            .await?;
+
+            let (_, stats) = scan_result?;
+
+            // Wait for progress task to finish
+            drop(progress_handle);
+
+            // Clear progress output and show completion
+            print!("\r\x1B[J"); // Clear from cursor to end of screen
+            println!("Demo scan complete!");
+            println!("  Files: {}", stats.total_files);
+            println!("  Directories: {}", stats.total_dirs);
+            println!("  Total size: {} bytes", stats.total_size);
+
+            // Signal actor to shutdown and wait for it to finish
+            tx.send(ActorMessage::Shutdown).await?;
+            drop(tx);
+
+            println!("Waiting for database writes to complete...");
+            actor_handle.await??;
+
+            demo_db.complete_scan(scan_id, &stats).await?;
+            println!("Demo scan {} saved to in-memory database", scan_id);
+        }
+        Some(Commands::Scan { path }) => {
             println!("Scanning: {}", path.display());
             let scan_id = db.create_scan(&path).await?;
 
@@ -75,12 +171,41 @@ async fn main() -> Result<()> {
             // Spawn progress monitor task
             let progress_handle = tokio::spawn(async move {
                 while let Some(progress) = progress_rx.recv().await {
-                    print!("\r\x1B[K"); // Clear line
-                    print!(
-                        "Progress: {} entries | Current: {}",
-                        progress.files_scanned,
-                        truncate_path(&progress.current_path, 60)
-                    );
+                    // Clear previous output (up to 5 lines)
+                    print!("\r\x1B[J"); // Clear from cursor to end of screen
+
+                    // Show summary line
+                    print!("Progress: {} entries scanned", progress.files_scanned);
+
+                    if progress.active_workers > 0 {
+                        print!(" | {} parallel workers", progress.active_workers);
+                    }
+                    println!();
+
+                    // Show active directories (limit to top 4 for readability)
+                    let max_display = 4;
+                    for (idx, (dir_path, done, total)) in
+                        progress.active_dirs.iter().take(max_display).enumerate()
+                    {
+                        let percentage = if *total > 0 {
+                            (*done as f64 / *total as f64 * 100.0) as usize
+                        } else {
+                            0
+                        };
+
+                        // Show intelligently truncated path
+                        let display_path = smart_truncate_path(dir_path, 70);
+
+                        println!("  [{}/{}] {:>3}% {}", done, total, percentage, display_path);
+                    }
+
+                    if progress.active_dirs.len() > max_display {
+                        println!(
+                            "  ... and {} more directories",
+                            progress.active_dirs.len() - max_display
+                        );
+                    }
+
                     std::io::Write::flush(&mut std::io::stdout()).ok();
                 }
             });
@@ -99,7 +224,9 @@ async fn main() -> Result<()> {
             // Wait for progress task to finish
             drop(progress_handle);
 
-            println!("\r\x1B[KScan complete!"); // Clear progress line
+            // Clear progress output and show completion
+            print!("\r\x1B[J"); // Clear from cursor to end of screen
+            println!("Scan complete!");
             println!("  Files: {}", stats.total_files);
             println!("  Directories: {}", stats.total_dirs);
             println!("  Total size: {} bytes", stats.total_size);
@@ -114,11 +241,11 @@ async fn main() -> Result<()> {
             db.complete_scan(scan_id, &stats).await?;
             println!("Scan {} saved to database", scan_id);
         }
-        Commands::Browse => {
+        Some(Commands::Browse) => {
             let mut app = App::new(db);
             app.run().await?;
         }
-        Commands::List => {
+        Some(Commands::List) => {
             let scans = db.list_scans().await?;
             if scans.is_empty() {
                 println!("No scans found. Run 'rootkitty scan <path>' to create one.");
@@ -141,7 +268,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Show { scan_id } => {
+        Some(Commands::Show { scan_id }) => {
             let scan = db.get_scan(scan_id).await?;
             if let Some(scan) = scan {
                 println!("Scan ID: {}", scan.id);
@@ -166,10 +293,10 @@ async fn main() -> Result<()> {
                 println!("Scan {} not found", scan_id);
             }
         }
-        Commands::Diff {
+        Some(Commands::Diff {
             scan_id_1,
             scan_id_2,
-        } => {
+        }) => {
             let scan1 = db.get_scan(scan_id_1).await?;
             let scan2 = db.get_scan(scan_id_2).await?;
 
@@ -227,6 +354,48 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Intelligently truncate a path by preserving the base and end, compressing the middle
+fn smart_truncate_path(path: &str, max_len: usize) -> String {
+    if path.len() <= max_len {
+        return path.to_string();
+    }
+
+    // Try to split the path into components
+    let parts: Vec<&str> = path.split('/').collect();
+
+    if parts.len() <= 3 {
+        // If it's a short path, use simple truncation from the start
+        let end_len = max_len.saturating_sub(3);
+        return format!("...{}", &path[path.len().saturating_sub(end_len)..]);
+    }
+
+    // Show first 2 components (like ~/user or /home/user)
+    let base = parts[..2.min(parts.len())].join("/");
+
+    // Show last 2 components
+    let end = if parts.len() >= 2 {
+        parts[parts.len() - 2..].join("/")
+    } else {
+        parts.last().unwrap_or(&"").to_string()
+    };
+
+    // Calculate what we have so far
+    let base_and_end = format!("{}/.../{}", base, end);
+
+    if base_and_end.len() <= max_len {
+        base_and_end
+    } else {
+        // If still too long, just truncate with ellipsis in middle
+        let start_len = (max_len / 2).saturating_sub(2);
+        let end_len = (max_len / 2).saturating_sub(2);
+        format!(
+            "{}...{}",
+            &path[..start_len],
+            &path[path.len().saturating_sub(end_len)..]
+        )
     }
 }
 

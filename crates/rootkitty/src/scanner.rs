@@ -1,9 +1,10 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -31,6 +32,10 @@ pub struct ProgressUpdate {
     pub dirs_scanned: u64,
     pub total_size: u64,
     pub current_path: String,
+    /// Currently active directories being scanned (path -> (files_done, total_files))
+    pub active_dirs: Vec<(String, usize, usize)>,
+    /// Approximate number of active parallel workers
+    pub active_workers: usize,
 }
 
 const BUFFER_SIZE: usize = 1000;
@@ -43,6 +48,12 @@ pub struct Scanner {
     sender: Option<mpsc::Sender<crate::db::ActorMessage>>,
     progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     entries_processed: Arc<AtomicU64>,
+    /// Track active directories: path -> (completed, total)
+    active_dirs: Arc<Mutex<HashMap<String, (usize, usize)>>>,
+    /// Approximate count of active parallel workers
+    active_workers: Arc<AtomicUsize>,
+    /// If true, run a simulated demo scan instead of real filesystem scan
+    demo_mode: bool,
 }
 
 impl Scanner {
@@ -58,6 +69,9 @@ impl Scanner {
             sender: None,
             progress_sender: None,
             entries_processed: Arc::new(AtomicU64::new(0)),
+            active_dirs: Arc::new(Mutex::new(HashMap::new())),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            demo_mode: false,
         }
     }
 
@@ -77,10 +91,40 @@ impl Scanner {
             sender: Some(sender),
             progress_sender,
             entries_processed: Arc::new(AtomicU64::new(0)),
+            active_dirs: Arc::new(Mutex::new(HashMap::new())),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            demo_mode: false,
+        }
+    }
+
+    pub fn with_sender_demo<P: AsRef<Path>>(
+        root_path: P,
+        sender: mpsc::Sender<crate::db::ActorMessage>,
+        progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+    ) -> Self {
+        Self {
+            root_path: root_path.as_ref().to_path_buf(),
+            entries: Arc::new(Mutex::new(Vec::new())),
+            stats: Arc::new(ScanStats {
+                total_size: 0,
+                total_files: 0,
+                total_dirs: 0,
+            }),
+            sender: Some(sender),
+            progress_sender,
+            entries_processed: Arc::new(AtomicU64::new(0)),
+            active_dirs: Arc::new(Mutex::new(HashMap::new())),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            demo_mode: true,
         }
     }
 
     pub fn scan(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
+        // Check if this is a demo scan
+        if self.demo_mode {
+            return self.demo_scan();
+        }
+
         let total_size = AtomicU64::new(0);
         let total_files = AtomicU64::new(0);
         let total_dirs = AtomicU64::new(0);
@@ -172,27 +216,53 @@ impl Scanner {
             };
 
             let children: Vec<_> = read_dir.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            let num_children = children.len();
+
+            // Register this directory in active tracking
+            let dir_path_str = path.display().to_string();
+            {
+                let mut active = self.active_dirs.lock().unwrap();
+                active.insert(dir_path_str.clone(), (0, num_children));
+            }
 
             // For small directories, process serially; for large ones, use parallelism
-            if children.len() > 100 {
+            if num_children > 100 {
+                // Increment worker count for parallel processing
+                self.active_workers.fetch_add(1, Ordering::Relaxed);
+
                 let child_sizes: Vec<u64> = children
                     .par_iter()
-                    .filter_map(|child_path| {
-                        self.scan_recursive(
-                            child_path,
-                            depth + 1,
-                            total_size,
-                            total_files,
-                            total_dirs,
-                        )
-                        .ok()
+                    .enumerate()
+                    .filter_map(|(idx, child_path)| {
+                        let result = self
+                            .scan_recursive(
+                                child_path,
+                                depth + 1,
+                                total_size,
+                                total_files,
+                                total_dirs,
+                            )
+                            .ok();
+
+                        // Update directory progress after processing each child
+                        {
+                            let mut active = self.active_dirs.lock().unwrap();
+                            if let Some(progress) = active.get_mut(&dir_path_str) {
+                                progress.0 = idx + 1;
+                            }
+                        }
+
+                        result
                     })
                     .collect();
                 dir_size = child_sizes.iter().sum();
+
+                // Decrement worker count
+                self.active_workers.fetch_sub(1, Ordering::Relaxed);
             } else {
-                for child_path in children {
+                for (idx, child_path) in children.iter().enumerate() {
                     if let Ok(size) = self.scan_recursive(
-                        &child_path,
+                        child_path,
                         depth + 1,
                         total_size,
                         total_files,
@@ -200,7 +270,21 @@ impl Scanner {
                     ) {
                         dir_size += size;
                     }
+
+                    // Update directory progress
+                    {
+                        let mut active = self.active_dirs.lock().unwrap();
+                        if let Some(progress) = active.get_mut(&dir_path_str) {
+                            progress.0 = idx + 1;
+                        }
+                    }
                 }
+            }
+
+            // Remove this directory from active tracking
+            {
+                let mut active = self.active_dirs.lock().unwrap();
+                active.remove(&dir_path_str);
             }
         } else {
             total_files.fetch_add(1, Ordering::Relaxed);
@@ -220,6 +304,89 @@ impl Scanner {
         Ok(dir_size)
     }
 
+    /// Demo scanner that simulates scanning without touching filesystem
+    /// Useful for testing the UI and progress display
+    pub fn demo_scan(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
+        use std::thread;
+        use std::time::Duration;
+
+        let total_size = AtomicU64::new(0);
+        let total_files = AtomicU64::new(0);
+        let total_dirs = AtomicU64::new(0);
+
+        // Simulate scanning several directories
+        let demo_dirs = vec![
+            ("/demo/src", 150),
+            ("/demo/target/debug", 500),
+            ("/demo/target/release", 300),
+            ("/demo/node_modules", 1200),
+            ("/demo/docs", 50),
+        ];
+
+        for (dir_path, file_count) in demo_dirs {
+            // Register this directory
+            {
+                let mut active = self.active_dirs.lock().unwrap();
+                active.insert(dir_path.to_string(), (0, file_count));
+            }
+
+            // Simulate processing files in this directory
+            for i in 0..file_count {
+                // Simulate some work
+                thread::sleep(Duration::from_millis(5));
+
+                // Create a fake entry
+                let entry = FileEntry {
+                    path: PathBuf::from(format!("{}/file_{}.txt", dir_path, i)),
+                    name: format!("file_{}.txt", i),
+                    parent_path: Some(PathBuf::from(dir_path)),
+                    size: 1024 * (i as u64 % 100),
+                    is_dir: false,
+                    modified_at: None,
+                    depth: dir_path.split('/').count(),
+                };
+
+                total_files.fetch_add(1, Ordering::Relaxed);
+                total_size.fetch_add(entry.size, Ordering::Relaxed);
+
+                self.add_entry(entry);
+
+                // Update directory progress
+                {
+                    let mut active = self.active_dirs.lock().unwrap();
+                    if let Some(progress) = active.get_mut(dir_path) {
+                        progress.0 = i + 1;
+                    }
+                }
+            }
+
+            // Remove directory from active tracking
+            {
+                let mut active = self.active_dirs.lock().unwrap();
+                active.remove(dir_path);
+            }
+
+            total_dirs.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Final flush
+        self.flush_buffer()?;
+
+        let entries = if self.sender.is_some() {
+            Vec::new()
+        } else {
+            self.entries.lock().unwrap().clone()
+        };
+
+        let stats = ScanStats {
+            total_size: total_size.load(Ordering::Relaxed),
+            total_files: total_files.load(Ordering::Relaxed),
+            total_dirs: total_dirs.load(Ordering::Relaxed),
+        };
+
+        Ok((entries, stats))
+    }
+
     fn add_entry(&self, entry: FileEntry) {
         let should_flush = {
             let mut entries = self.entries.lock().unwrap();
@@ -236,11 +403,22 @@ impl Scanner {
         let count = self.entries_processed.fetch_add(1, Ordering::Relaxed);
         if let Some(progress_tx) = &self.progress_sender {
             if count % PROGRESS_UPDATE_INTERVAL == 0 {
+                // Snapshot of currently active directories
+                let active_dirs_snapshot: Vec<(String, usize, usize)> = {
+                    let active = self.active_dirs.lock().unwrap();
+                    active
+                        .iter()
+                        .map(|(path, (done, total))| (path.clone(), *done, *total))
+                        .collect()
+                };
+
                 let _ = progress_tx.send(ProgressUpdate {
                     files_scanned: count,
                     dirs_scanned: 0, // Will be updated from atomics if needed
                     total_size: 0,   // Will be updated from atomics if needed
                     current_path: entry.path.display().to_string(),
+                    active_dirs: active_dirs_snapshot,
+                    active_workers: self.active_workers.load(Ordering::Relaxed),
                 });
             }
         }

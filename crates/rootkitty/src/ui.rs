@@ -14,13 +14,25 @@ use ratatui::{
 };
 use std::io;
 
-use crate::db::{Database, Scan, StoredFileEntry};
+use crate::db::{ActorMessage, Database, DatabaseActor, Scan, StoredFileEntry};
+use crate::scanner::{ProgressUpdate, Scanner};
+use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     ScanList,
     FileTree,
     CleanupList,
+    ScanDialog,
+    Scanning,
+}
+
+#[derive(Debug, Clone)]
+struct ScanProgress {
+    entries_scanned: u64,
+    active_dirs: Vec<(String, usize, usize)>,
+    active_workers: usize,
 }
 
 pub struct App {
@@ -34,6 +46,9 @@ pub struct App {
     cleanup_items: Vec<StoredFileEntry>,
     cleanup_list_state: ListState,
     status_message: String,
+    scan_input: String,
+    scan_progress: Option<ScanProgress>,
+    previous_view: View,
 }
 
 impl App {
@@ -51,7 +66,10 @@ impl App {
             file_list_state: ListState::default(),
             cleanup_items: Vec::new(),
             cleanup_list_state: ListState::default(),
-            status_message: String::from("Press ? for help"),
+            status_message: String::from("Press 'n' to scan | '?' for help"),
+            scan_input: String::new(),
+            scan_progress: None,
+            previous_view: View::ScanList,
         }
     }
 
@@ -89,6 +107,11 @@ impl App {
                     match self.view {
                         View::ScanList => match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('n') => {
+                                self.previous_view = View::ScanList;
+                                self.view = View::ScanDialog;
+                                self.scan_input.clear();
+                            }
                             KeyCode::Down | KeyCode::Char('j') => self.scan_list_next(),
                             KeyCode::Up | KeyCode::Char('k') => self.scan_list_previous(),
                             KeyCode::Enter => {
@@ -150,6 +173,36 @@ impl App {
                             KeyCode::Char('3') => self.view = View::CleanupList,
                             _ => {}
                         },
+                        View::ScanDialog => match key.code {
+                            KeyCode::Esc => {
+                                self.view = self.previous_view;
+                                self.scan_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                if !self.scan_input.is_empty() {
+                                    let path = self.scan_input.clone();
+                                    if let Err(e) = self.start_scan(path, terminal).await {
+                                        self.status_message = format!("Scan error: {}", e);
+                                        self.view = self.previous_view;
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                self.scan_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                self.scan_input.push(c);
+                            }
+                            _ => {}
+                        },
+                        View::Scanning => {
+                            // During scanning, only allow cancel
+                            if let KeyCode::Char('q') | KeyCode::Esc = key.code {
+                                self.status_message =
+                                    "Scan cancelled (not implemented yet)".to_string();
+                                // TODO: Actually cancel the scan
+                            }
+                        }
                     }
                 }
             }
@@ -166,6 +219,8 @@ impl App {
             View::ScanList => self.render_scan_list(f, chunks[0]),
             View::FileTree => self.render_file_tree(f, chunks[0]),
             View::CleanupList => self.render_cleanup_list(f, chunks[0]),
+            View::ScanDialog => self.render_scan_dialog(f, chunks[0]),
+            View::Scanning => self.render_scanning(f, chunks[0]),
         }
 
         self.render_status_bar(f, chunks[1]);
@@ -275,16 +330,103 @@ impl App {
         f.render_stateful_widget(list, area, &mut self.cleanup_list_state);
     }
 
+    fn render_scan_dialog(&self, f: &mut Frame, area: Rect) {
+        let text = vec![
+            Line::from(""),
+            Line::from("Enter path to scan:"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                &self.scan_input,
+                Style::default().fg(Color::Cyan),
+            )]),
+            Line::from(""),
+            Line::from("Press Enter to start scan, Esc to cancel"),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title("New Scan"))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(paragraph, area);
+    }
+
+    fn render_scanning(&self, f: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Scanning in progress...",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+        ];
+
+        if let Some(progress) = &self.scan_progress {
+            lines.push(Line::from(format!(
+                "Entries scanned: {}",
+                progress.entries_scanned
+            )));
+
+            if progress.active_workers > 0 {
+                lines.push(Line::from(format!(
+                    "Parallel workers: {}",
+                    progress.active_workers
+                )));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from("Active directories:"));
+
+            for (path, done, total) in progress.active_dirs.iter().take(5) {
+                let percentage = if *total > 0 {
+                    (*done as f64 / *total as f64 * 100.0) as usize
+                } else {
+                    0
+                };
+                lines.push(Line::from(format!(
+                    "  [{}/{}] {:>3}% {}",
+                    done,
+                    total,
+                    percentage,
+                    Self::smart_truncate_path(path, 60)
+                )));
+            }
+
+            if progress.active_dirs.len() > 5 {
+                lines.push(Line::from(format!(
+                    "  ... and {} more directories",
+                    progress.active_dirs.len() - 5
+                )));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from("Press q or Esc to cancel (not implemented)"));
+
+        let paragraph = Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title("Scanning"))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(paragraph, area);
+    }
+
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
         let help_text = match self.view {
             View::ScanList => {
-                "q: quit | 1: scans | 2: files | 3: cleanup | ↑↓/jk: navigate | Enter: select"
+                "q: quit | n: new scan | 1: scans | 2: files | 3: cleanup | ↑↓/jk: navigate | Enter: select"
             }
             View::FileTree => {
                 "q: quit | 1: scans | 2: files | 3: cleanup | Space: mark | ↑↓/jk: navigate"
             }
             View::CleanupList => {
                 "q: quit | 1: scans | 2: files | 3: cleanup | g: generate | Space: remove"
+            }
+            View::ScanDialog => {
+                "Enter: start scan | Esc: cancel | Type path to scan"
+            }
+            View::Scanning => {
+                "Scanning in progress... | q/Esc: cancel"
             }
         };
 
@@ -367,6 +509,131 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    async fn start_scan(
+        &mut self,
+        path: String,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        let path_buf = PathBuf::from(shellexpand::tilde(&path).to_string());
+
+        // Switch to scanning view
+        self.view = View::Scanning;
+        self.scan_progress = Some(ScanProgress {
+            entries_scanned: 0,
+            active_dirs: Vec::new(),
+            active_workers: 0,
+        });
+
+        // Create scan in database
+        let scan_id = self.db.create_scan(&path_buf).await?;
+
+        // Create channels
+        let (tx, rx) = mpsc::channel(100);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+
+        // Spawn database actor
+        let actor = DatabaseActor::new(self.db.clone(), scan_id, rx);
+        let actor_handle = tokio::spawn(async move { actor.run().await });
+
+        // Clone for the scanning thread
+        let tx_clone = tx.clone();
+        let path_clone = path_buf.clone();
+
+        // Spawn scanner in blocking thread
+        let scan_handle = tokio::task::spawn_blocking(move || {
+            let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx));
+            scanner.scan()
+        });
+
+        // Poll for progress updates and render
+        loop {
+            // Check for progress updates
+            match progress_rx.try_recv() {
+                Ok(progress) => {
+                    self.scan_progress = Some(ScanProgress {
+                        entries_scanned: progress.files_scanned,
+                        active_dirs: progress.active_dirs.clone(),
+                        active_workers: progress.active_workers,
+                    });
+                    terminal.draw(|f| self.render(f))?;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // No update available, continue
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Scanner finished
+                    break;
+                }
+            }
+
+            // Small sleep to avoid busy-waiting
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Check if scan is complete
+            if scan_handle.is_finished() {
+                break;
+            }
+        }
+
+        // Get scan result
+        let (_, stats) = scan_handle.await??;
+
+        // Signal actor to shutdown
+        tx.send(ActorMessage::Shutdown).await?;
+        drop(tx);
+
+        // Wait for database writes to complete
+        actor_handle.await??;
+
+        // Complete the scan
+        self.db.complete_scan(scan_id, &stats).await?;
+
+        // Reload scans and return to scan list
+        self.load_scans().await?;
+        self.view = View::ScanList;
+        self.status_message = format!(
+            "Scan complete! {} files, {} dirs, {} bytes",
+            stats.total_files, stats.total_dirs, stats.total_size
+        );
+        self.scan_progress = None;
+
+        Ok(())
+    }
+
+    fn smart_truncate_path(path: &str, max_len: usize) -> String {
+        if path.len() <= max_len {
+            return path.to_string();
+        }
+
+        let parts: Vec<&str> = path.split('/').collect();
+
+        if parts.len() <= 3 {
+            let end_len = max_len.saturating_sub(3);
+            return format!("...{}", &path[path.len().saturating_sub(end_len)..]);
+        }
+
+        let base = parts[..2.min(parts.len())].join("/");
+        let end = if parts.len() >= 2 {
+            parts[parts.len() - 2..].join("/")
+        } else {
+            parts.last().unwrap_or(&"").to_string()
+        };
+
+        let base_and_end = format!("{}/.../{}", base, end);
+
+        if base_and_end.len() <= max_len {
+            base_and_end
+        } else {
+            let start_len = (max_len / 2).saturating_sub(2);
+            let end_len = (max_len / 2).saturating_sub(2);
+            format!(
+                "{}...{}",
+                &path[..start_len],
+                &path[path.len().saturating_sub(end_len)..]
+            )
+        }
     }
 
     fn generate_cleanup_script(&mut self) {
