@@ -1,0 +1,39 @@
+# Project
+/local/
+/build/
+/dist/
+/run/
+/srv/
+
+# Rust
+target/
+**/*.rs.bk
+.cargo/
+*.pdb
+
+# Vim
+*.swp
+*.swo
+
+# bazel
+bazel-*
+
+# macOS
+.DS_Store
+
+# npm
+node_modules/
+
+# Python
+*.pyc
+__pycache__/
+
+**/.claude/settings.local.json
+
+MODULE.bazel.lock
+
+# Rootkitty specific
+*.db
+*.db-shm
+*.db-wal
+cleanup.sh
