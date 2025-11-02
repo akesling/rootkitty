@@ -76,6 +76,12 @@ pub struct Database {
 }
 
 impl Database {
+    /// Create a Database from an existing pool (useful for testing)
+    #[doc(hidden)]
+    pub fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db_path = db_path.as_ref();
 
@@ -390,5 +396,255 @@ impl Database {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    async fn create_test_db() -> Database {
+        // Use in-memory database for testing
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        // Manually create schema for tests (don't rely on migration files)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_path TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                total_size INTEGER NOT NULL DEFAULT 0,
+                total_files INTEGER NOT NULL DEFAULT 0,
+                total_dirs INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed'))
+            );
+            CREATE INDEX idx_scans_started_at ON scans(started_at DESC);
+            CREATE INDEX idx_scans_root_path ON scans(root_path);
+
+            CREATE TABLE IF NOT EXISTS file_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                parent_path TEXT,
+                size INTEGER NOT NULL,
+                is_dir INTEGER NOT NULL,
+                modified_at TEXT,
+                depth INTEGER NOT NULL,
+                FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_file_entries_scan_id ON file_entries(scan_id);
+            CREATE INDEX idx_file_entries_path ON file_entries(scan_id, path);
+            CREATE INDEX idx_file_entries_parent ON file_entries(scan_id, parent_path);
+            CREATE INDEX idx_file_entries_size ON file_entries(scan_id, size DESC);
+
+            CREATE TABLE IF NOT EXISTS cleanup_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id INTEGER NOT NULL,
+                file_entry_id INTEGER NOT NULL,
+                marked_at TEXT NOT NULL,
+                reason TEXT,
+                FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_entry_id) REFERENCES file_entries(id) ON DELETE CASCADE,
+                UNIQUE(scan_id, file_entry_id)
+            );
+            CREATE INDEX idx_cleanup_items_scan_id ON cleanup_items(scan_id);
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        Database { pool }
+    }
+
+    fn create_test_entry(name: &str, size: u64, is_dir: bool) -> FileEntry {
+        FileEntry {
+            path: PathBuf::from(format!("/test/{}", name)),
+            name: name.to_string(),
+            parent_path: Some(PathBuf::from("/test")),
+            size,
+            is_dir,
+            modified_at: Some(Utc::now()),
+            depth: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_and_get_scan() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test/path");
+
+        let scan_id = db.create_scan(&path).await.unwrap();
+        assert!(scan_id > 0);
+
+        let scan = db.get_scan(scan_id).await.unwrap();
+        assert!(scan.is_some());
+
+        let scan = scan.unwrap();
+        assert_eq!(scan.id, scan_id);
+        assert_eq!(scan.root_path, "/test/path");
+        assert_eq!(scan.status, "running");
+    }
+
+    #[tokio::test]
+    async fn test_complete_scan() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test/path");
+
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        let stats = ScanStats {
+            total_size: 1000,
+            total_files: 10,
+            total_dirs: 5,
+        };
+
+        db.complete_scan(scan_id, &stats).await.unwrap();
+
+        let scan = db.get_scan(scan_id).await.unwrap().unwrap();
+        assert_eq!(scan.status, "completed");
+        assert_eq!(scan.total_size, 1000);
+        assert_eq!(scan.total_files, 10);
+        assert_eq!(scan.total_dirs, 5);
+        assert!(scan.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_insert_and_retrieve_entries() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test");
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        let entries = vec![
+            create_test_entry("file1.txt", 100, false),
+            create_test_entry("file2.txt", 200, false),
+            create_test_entry("dir1", 300, true),
+        ];
+
+        db.insert_file_entries(scan_id, &entries).await.unwrap();
+
+        let largest = db.get_largest_entries(scan_id, 10).await.unwrap();
+        assert_eq!(largest.len(), 3);
+
+        // Should be sorted by size descending
+        assert_eq!(largest[0].size, 300);
+        assert_eq!(largest[1].size, 200);
+        assert_eq!(largest[2].size, 100);
+    }
+
+    #[tokio::test]
+    async fn test_list_scans() {
+        let db = create_test_db().await;
+
+        let scan1_id = db.create_scan(&PathBuf::from("/test1")).await.unwrap();
+        let scan2_id = db.create_scan(&PathBuf::from("/test2")).await.unwrap();
+
+        let scans = db.list_scans().await.unwrap();
+        assert_eq!(scans.len(), 2);
+
+        // Should be ordered by started_at DESC (most recent first)
+        assert_eq!(scans[0].id, scan2_id);
+        assert_eq!(scans[1].id, scan1_id);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_items() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test");
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        let entries = vec![
+            create_test_entry("file1.txt", 100, false),
+            create_test_entry("file2.txt", 200, false),
+        ];
+
+        db.insert_file_entries(scan_id, &entries).await.unwrap();
+
+        // Get entry IDs
+        let stored_entries = db.get_largest_entries(scan_id, 10).await.unwrap();
+        let entry1_id = stored_entries[1].id; // Smaller file
+        let entry2_id = stored_entries[0].id; // Larger file
+
+        // Mark for cleanup
+        db.mark_for_cleanup(scan_id, entry1_id, Some("test reason"))
+            .await
+            .unwrap();
+        db.mark_for_cleanup(scan_id, entry2_id, None).await.unwrap();
+
+        // Retrieve cleanup items
+        let cleanup_items = db.get_cleanup_items(scan_id).await.unwrap();
+        assert_eq!(cleanup_items.len(), 2);
+
+        // Remove one cleanup item
+        db.remove_cleanup_item(scan_id, entry1_id).await.unwrap();
+
+        let cleanup_items = db.get_cleanup_items(scan_id).await.unwrap();
+        assert_eq!(cleanup_items.len(), 1);
+        assert_eq!(cleanup_items[0].id, entry2_id);
+    }
+
+    #[tokio::test]
+    async fn test_database_actor() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test");
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+        let actor = DatabaseActor::new(db.clone(), scan_id, rx);
+        let actor_handle = tokio::spawn(async move { actor.run().await });
+
+        // Send some entries
+        let entries = vec![
+            create_test_entry("file1.txt", 100, false),
+            create_test_entry("file2.txt", 200, false),
+        ];
+        tx.send(ActorMessage::InsertBatch(entries)).await.unwrap();
+
+        // Send shutdown
+        tx.send(ActorMessage::Shutdown).await.unwrap();
+        drop(tx);
+
+        // Wait for actor to finish
+        actor_handle.await.unwrap().unwrap();
+
+        // Verify entries were inserted
+        let stored = db.get_largest_entries(scan_id, 10).await.unwrap();
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_batched_inserts() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test");
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        // Create many entries to test batching
+        let mut entries = Vec::new();
+        for i in 0..1000 {
+            entries.push(create_test_entry(
+                &format!("file{}.txt", i),
+                i as u64,
+                false,
+            ));
+        }
+
+        db.insert_file_entries(scan_id, &entries).await.unwrap();
+
+        let stored = db.get_largest_entries(scan_id, 10).await.unwrap();
+        assert_eq!(stored.len(), 10);
+        assert_eq!(stored[0].size, 999); // Largest should be first
     }
 }

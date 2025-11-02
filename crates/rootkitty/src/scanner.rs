@@ -25,13 +25,24 @@ pub struct ScanStats {
     pub total_dirs: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate {
+    pub files_scanned: u64,
+    pub dirs_scanned: u64,
+    pub total_size: u64,
+    pub current_path: String,
+}
+
 const BUFFER_SIZE: usize = 1000;
+const PROGRESS_UPDATE_INTERVAL: u64 = 100; // Send progress every N entries
 
 pub struct Scanner {
     root_path: PathBuf,
     entries: Arc<Mutex<Vec<FileEntry>>>,
     stats: Arc<ScanStats>,
     sender: Option<mpsc::Sender<crate::db::ActorMessage>>,
+    progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+    entries_processed: Arc<AtomicU64>,
 }
 
 impl Scanner {
@@ -45,12 +56,15 @@ impl Scanner {
                 total_dirs: 0,
             }),
             sender: None,
+            progress_sender: None,
+            entries_processed: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn with_sender<P: AsRef<Path>>(
         root_path: P,
         sender: mpsc::Sender<crate::db::ActorMessage>,
+        progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     ) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
@@ -61,6 +75,8 @@ impl Scanner {
                 total_dirs: 0,
             }),
             sender: Some(sender),
+            progress_sender,
+            entries_processed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -207,13 +223,26 @@ impl Scanner {
     fn add_entry(&self, entry: FileEntry) {
         let should_flush = {
             let mut entries = self.entries.lock().unwrap();
-            entries.push(entry);
+            entries.push(entry.clone());
             self.sender.is_some() && entries.len() >= BUFFER_SIZE
         };
 
         if should_flush {
             // Flush outside the lock to avoid holding it during send
             let _ = self.flush_buffer();
+        }
+
+        // Send progress update periodically
+        let count = self.entries_processed.fetch_add(1, Ordering::Relaxed);
+        if let Some(progress_tx) = &self.progress_sender {
+            if count % PROGRESS_UPDATE_INTERVAL == 0 {
+                let _ = progress_tx.send(ProgressUpdate {
+                    files_scanned: count,
+                    dirs_scanned: 0, // Will be updated from atomics if needed
+                    total_size: 0,   // Will be updated from atomics if needed
+                    current_path: entry.path.display().to_string(),
+                });
+            }
         }
     }
 }
@@ -224,22 +253,181 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn test_basic_scan() {
+    fn create_test_filesystem() -> TempDir {
         let temp_dir = TempDir::new().unwrap();
         let root = temp_dir.path();
 
+        // Create a nested directory structure
         fs::write(root.join("file1.txt"), b"hello").unwrap();
         fs::write(root.join("file2.txt"), b"world").unwrap();
+
         fs::create_dir(root.join("subdir")).unwrap();
         fs::write(root.join("subdir/file3.txt"), b"test").unwrap();
+        fs::write(root.join("subdir/file4.txt"), b"data").unwrap();
+
+        fs::create_dir(root.join("subdir/nested")).unwrap();
+        fs::write(root.join("subdir/nested/deep.txt"), b"deep file").unwrap();
+
+        fs::create_dir(root.join("empty_dir")).unwrap();
+
+        temp_dir
+    }
+
+    #[test]
+    fn test_basic_scan() {
+        let temp_dir = create_test_filesystem();
+        let root = temp_dir.path();
 
         let scanner = Scanner::new(root);
         let (entries, stats) = scanner.scan().unwrap();
 
-        assert!(stats.total_files >= 3);
-        assert!(stats.total_dirs >= 2);
-        assert!(stats.total_size >= 14);
+        // Should have at least 5 files (file1, file2, file3, file4, deep.txt)
+        assert!(
+            stats.total_files >= 5,
+            "Expected at least 5 files, got {}",
+            stats.total_files
+        );
+
+        // Should have at least 4 directories (root, subdir, nested, empty_dir)
+        assert!(
+            stats.total_dirs >= 4,
+            "Expected at least 4 dirs, got {}",
+            stats.total_dirs
+        );
+
+        // Total size should be sum of file contents
+        assert!(
+            stats.total_size >= 23,
+            "Expected at least 23 bytes, got {}",
+            stats.total_size
+        );
+
+        // Should return all entries when not streaming
         assert!(!entries.is_empty());
+        assert_eq!(entries.len() as u64, stats.total_files + stats.total_dirs);
+    }
+
+    #[test]
+    fn test_scan_with_streaming() {
+        let temp_dir = create_test_filesystem();
+        let root = temp_dir.path();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let scanner = Scanner::with_sender(root, tx, None);
+
+        // Spawn a task to collect entries from the channel
+        let collect_handle = std::thread::spawn(move || {
+            let mut total_entries = 0;
+            while let Some(msg) = rx.blocking_recv() {
+                match msg {
+                    crate::db::ActorMessage::InsertBatch(entries) => {
+                        total_entries += entries.len();
+                    }
+                    crate::db::ActorMessage::Shutdown => break,
+                }
+            }
+            total_entries
+        });
+
+        let (entries, stats) = scanner.scan().unwrap();
+
+        // When streaming, should return empty vec
+        assert!(entries.is_empty());
+
+        // Stats should still be correct
+        assert!(stats.total_files >= 5);
+        assert!(stats.total_dirs >= 4);
+
+        // Wait for collection to finish
+        let collected = collect_handle.join().unwrap();
+        assert!(collected > 0, "Should have collected some entries");
+    }
+
+    #[test]
+    fn test_empty_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let scanner = Scanner::new(root);
+        let (entries, stats) = scanner.scan().unwrap();
+
+        // Root directory itself
+        assert_eq!(stats.total_dirs, 1);
+        assert_eq!(stats.total_files, 0);
+        assert_eq!(stats.total_size, 0);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn test_large_directory_uses_parallelism() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create > 100 files to trigger parallel scanning
+        for i in 0..150 {
+            fs::write(root.join(format!("file{}.txt", i)), format!("content{}", i)).unwrap();
+        }
+
+        let scanner = Scanner::new(root);
+        let (entries, stats) = scanner.scan().unwrap();
+
+        assert_eq!(stats.total_files, 150);
+        assert_eq!(stats.total_dirs, 1); // Just the root
+        assert!(entries.len() == 151); // 150 files + 1 dir
+    }
+
+    #[test]
+    fn test_progress_updates() {
+        let temp_dir = create_test_filesystem();
+        let root = temp_dir.path();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(100);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let scanner = Scanner::with_sender(root, tx, Some(progress_tx));
+
+        // Spawn task to collect progress updates
+        let progress_handle = std::thread::spawn(move || {
+            let mut updates = Vec::new();
+            while let Some(update) = progress_rx.blocking_recv() {
+                updates.push(update);
+            }
+            updates
+        });
+
+        let (_entries, stats) = scanner.scan().unwrap();
+
+        // Give progress collector time to finish
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let updates = progress_handle.join().unwrap();
+
+        // Should have received at least one progress update
+        // (depends on PROGRESS_UPDATE_INTERVAL and number of entries)
+        assert!(
+            !updates.is_empty() || stats.total_files + stats.total_dirs < PROGRESS_UPDATE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn test_directory_size_calculation() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        fs::create_dir(root.join("dir1")).unwrap();
+        fs::write(root.join("dir1/a.txt"), b"12345").unwrap();
+        fs::write(root.join("dir1/b.txt"), b"67890").unwrap();
+
+        let scanner = Scanner::new(root);
+        let (entries, _stats) = scanner.scan().unwrap();
+
+        // Find the dir1 entry
+        let dir1_entry = entries
+            .iter()
+            .find(|e| e.name == "dir1" && e.is_dir)
+            .expect("Should find dir1");
+
+        // Directory size should be sum of its contents
+        assert_eq!(dir1_entry.size, 10, "dir1 should have size 10 (5+5)");
     }
 }

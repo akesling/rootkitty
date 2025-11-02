@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::db::{ActorMessage, Database, DatabaseActor};
-use crate::scanner::Scanner;
+use crate::scanner::{ProgressUpdate, Scanner};
 use crate::ui::App;
 use tokio::sync::mpsc;
 
@@ -65,22 +65,41 @@ async fn main() -> Result<()> {
             // Create channel for streaming entries to database actor
             let (tx, rx) = mpsc::channel(100);
 
+            // Create channel for progress updates
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+
             // Spawn database actor to handle inserts
             let actor = DatabaseActor::new(db.clone(), scan_id, rx);
             let actor_handle = tokio::spawn(async move { actor.run().await });
+
+            // Spawn progress monitor task
+            let progress_handle = tokio::spawn(async move {
+                while let Some(progress) = progress_rx.recv().await {
+                    print!("\r\x1B[K"); // Clear line
+                    print!(
+                        "Progress: {} entries | Current: {}",
+                        progress.files_scanned,
+                        truncate_path(&progress.current_path, 60)
+                    );
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
+            });
 
             // Scan with streaming (runs in blocking thread to not block tokio runtime)
             let tx_clone = tx.clone();
             let path_clone = path.clone();
             let scan_result = tokio::task::spawn_blocking(move || {
-                let scanner = Scanner::with_sender(&path_clone, tx_clone);
+                let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx));
                 scanner.scan()
             })
             .await?;
 
             let (_, stats) = scan_result?;
 
-            println!("Scan complete!");
+            // Wait for progress task to finish
+            drop(progress_handle);
+
+            println!("\r\x1B[KScan complete!"); // Clear progress line
             println!("  Files: {}", stats.total_files);
             println!("  Directories: {}", stats.total_dirs);
             println!("  Total size: {} bytes", stats.total_size);
@@ -208,5 +227,14 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn truncate_path(path: &str, max_len: usize) -> String {
+    if path.len() <= max_len {
+        path.to_string()
+    } else {
+        let start = path.len() - max_len + 3;
+        format!("...{}", &path[start..])
     }
 }

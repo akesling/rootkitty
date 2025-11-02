@@ -31,3 +31,6 @@ serde_json = "1.0"
 
 # Performance
 rayon = "1.10"
+
+# Testing
+tempfile = "3.14"
