@@ -28,6 +28,7 @@ enum View {
     CleanupList,
     ScanDialog,
     Scanning,
+    Help,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,8 @@ pub struct App {
     active_scan: Option<ActiveScan>,
     /// Track if 'g' was pressed for 'gg' sequence
     g_pressed: bool,
+    /// Set of folded directory paths (absolute paths)
+    folded_dirs: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -89,6 +92,7 @@ impl App {
             previous_view: View::ScanList,
             active_scan: None,
             g_pressed: false,
+            folded_dirs: std::collections::HashSet::new(),
         }
     }
 
@@ -126,6 +130,11 @@ impl App {
                     match self.view {
                         View::ScanList => match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('?') => {
+                                self.previous_view = View::ScanList;
+                                self.view = View::Help;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('n') => {
                                 self.previous_view = View::ScanList;
                                 self.view = View::ScanDialog;
@@ -215,6 +224,11 @@ impl App {
                         },
                         View::FileTree => match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('?') => {
+                                self.previous_view = View::FileTree;
+                                self.view = View::Help;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('g') => {
                                 if self.g_pressed {
                                     // gg - jump to top
@@ -253,6 +267,16 @@ impl App {
                                 }
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('z') => {
+                                // Toggle fold/unfold for selected directory (one level)
+                                self.toggle_fold_directory(false);
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('Z') => {
+                                // Unfold all nested folders recursively
+                                self.toggle_fold_directory(true);
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('1') => {
                                 self.view = View::ScanList;
                                 self.g_pressed = false;
@@ -275,6 +299,11 @@ impl App {
                         },
                         View::CleanupList => match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('?') => {
+                                self.previous_view = View::CleanupList;
+                                self.view = View::Help;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('g') => {
                                 if self.g_pressed {
                                     // gg - jump to top
@@ -367,6 +396,17 @@ impl App {
                                 if let Some(active_scan) = &self.active_scan {
                                     active_scan.cancelled.store(true, Ordering::Relaxed);
                                     self.status_message = "Cancelling scan...".to_string();
+                                }
+                            }
+                        }
+                        View::Help => {
+                            // Any key closes help
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('?') => {
+                                    self.view = self.previous_view;
+                                }
+                                _ => {
+                                    self.view = self.previous_view;
                                 }
                             }
                         }
@@ -483,6 +523,7 @@ impl App {
             View::CleanupList => self.render_cleanup_list(f, main_chunks[0]),
             View::ScanDialog => self.render_scan_dialog(f, main_chunks[0]),
             View::Scanning => self.render_scanning(f, main_chunks[0]),
+            View::Help => self.render_help(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -530,19 +571,28 @@ impl App {
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
         let title = if let Some(scan) = &self.current_scan {
             format!(
-                "Files (2) | Scan: {} | Space to mark for cleanup",
+                "Files (2) | Scan: {} | z: fold/unfold | Z: unfold all | Space: mark",
                 scan.root_path
             )
         } else {
             "Files (2)".to_string()
         };
 
-        let items: Vec<ListItem> = self
-            .file_entries
+        let visible_entries = self.get_visible_entries();
+        let items: Vec<ListItem> = visible_entries
             .iter()
             .map(|entry| {
                 let size_str = format_size(entry.size as u64);
-                let icon = if entry.is_dir { "📁" } else { "📄" };
+                let is_folded = entry.is_dir && self.folded_dirs.contains(&entry.path);
+                let icon = if entry.is_dir {
+                    if is_folded {
+                        "▶ 📁"
+                    } else {
+                        "▼ 📁"
+                    }
+                } else {
+                    "  📄"
+                };
                 let indent = "  ".repeat(entry.depth as usize);
                 let content = format!("{}{} {} ({})", indent, icon, entry.name, size_str);
                 ListItem::new(content)
@@ -563,7 +613,8 @@ impl App {
 
     fn render_file_info(&self, f: &mut Frame, area: Rect) {
         let info_text = if let Some(selected) = self.file_list_state.selected() {
-            if let Some(entry) = self.file_entries.get(selected) {
+            let visible_entries = self.get_visible_entries();
+            if let Some(entry) = visible_entries.get(selected) {
                 let file_type = if entry.is_dir { "Directory" } else { "File" };
                 let size_str = format_size(entry.size as u64);
 
@@ -650,6 +701,70 @@ impl App {
         f.render_widget(paragraph, area);
     }
 
+    fn render_help(&self, f: &mut Frame, area: Rect) {
+        let help_text = vec![
+            Line::from(vec![Span::styled(
+                "Rootkitty - Keyboard Shortcuts",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Navigation:",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from("  j/↓         Move down one item"),
+            Line::from("  k/↑         Move up one item"),
+            Line::from("  d           Page down (10 items)"),
+            Line::from("  u           Page up (10 items)"),
+            Line::from("  gg          Jump to top"),
+            Line::from("  G           Jump to bottom"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Views:",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from("  1           Scan list view"),
+            Line::from("  2           File tree view"),
+            Line::from("  3           Cleanup list view"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Actions:",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from("  n           New scan"),
+            Line::from("  r           Resume paused scan"),
+            Line::from("  Space       Mark/unmark file for cleanup (File view)"),
+            Line::from("  Space       Remove from cleanup list (Cleanup view)"),
+            Line::from("  z           Fold/unfold directory (File view)"),
+            Line::from("  Z           Unfold directory and all subdirs (File view)"),
+            Line::from("  s/g         Generate cleanup script (Cleanup view)"),
+            Line::from("  Enter       Select/open"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "General:",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from("  ?           Show this help"),
+            Line::from("  q           Quit / Cancel"),
+            Line::from("  Esc         Cancel / Go back"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "Press any key to close",
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            )]),
+        ];
+
+        let paragraph = Paragraph::new(help_text)
+            .block(Block::default().borders(Borders::ALL).title("Help (?)"))
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
+    }
+
     fn render_scanning(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(""),
@@ -728,6 +843,9 @@ impl App {
             View::Scanning => {
                 "q/Esc: cancel scan"
             }
+            View::Help => {
+                "Press any key to close help"
+            }
         };
 
         let text = vec![
@@ -760,16 +878,108 @@ impl App {
                 self.file_entries = self.db.get_largest_entries(scan.id, 1000).await?;
                 self.file_list_state.select(Some(0));
                 self.view = View::FileTree;
+
+                // Initialize folded state: fold all directories except the root
+                self.folded_dirs.clear();
+                self.initialize_folded_state();
+
                 self.status_message = format!("Loaded {} entries", self.file_entries.len());
             }
         }
         Ok(())
     }
 
+    fn initialize_folded_state(&mut self) {
+        // Fold all directories except the root (depth 0)
+        for entry in &self.file_entries {
+            if entry.is_dir && entry.depth > 0 {
+                self.folded_dirs.insert(entry.path.clone());
+            }
+        }
+    }
+
+    fn toggle_fold_directory(&mut self, recursive: bool) {
+        if let Some(selected) = self.file_list_state.selected() {
+            let visible_entries = self.get_visible_entries();
+            if let Some(entry) = visible_entries.get(selected) {
+                if !entry.is_dir {
+                    self.status_message = "Not a directory".to_string();
+                    return;
+                }
+
+                let dir_path = entry.path.clone();
+                let dir_name = entry.name.clone();
+                let dir_depth = entry.depth;
+                let is_folded = self.folded_dirs.contains(&dir_path);
+
+                if is_folded {
+                    // Unfold
+                    if recursive {
+                        // Shift+Z: Unfold all nested folders recursively
+                        self.unfold_recursive(&dir_path);
+                        self.status_message =
+                            format!("Unfolded '{}' and all subdirectories", dir_name);
+                    } else {
+                        // z: Unfold one level only
+                        self.unfold_one_level(&dir_path, dir_depth);
+                        self.status_message = format!("Unfolded '{}'", dir_name);
+                    }
+                } else {
+                    // Fold - collapse this directory and all its descendants
+                    self.fold_directory(&dir_path);
+                    self.status_message = format!("Folded '{}'", dir_name);
+                }
+            }
+        }
+    }
+
+    fn unfold_one_level(&mut self, parent_path: &str, parent_depth: i64) {
+        // Remove the parent from folded set
+        self.folded_dirs.remove(parent_path);
+
+        // Ensure all immediate subdirectories are folded
+        let target_depth = parent_depth + 1;
+        for entry in &self.file_entries {
+            if entry.is_dir && entry.depth == target_depth {
+                // Check if this is a direct child of parent_path
+                if entry.path.starts_with(parent_path) && entry.path != parent_path {
+                    // Count slashes to verify it's a direct child
+                    let relative_path = &entry.path[parent_path.len()..];
+                    let slash_count = relative_path.chars().filter(|c| *c == '/').count();
+                    // Direct child should have exactly 1 slash (the leading one)
+                    if slash_count == 1 {
+                        self.folded_dirs.insert(entry.path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn fold_directory(&mut self, dir_path: &str) {
+        // Add this directory to folded set
+        self.folded_dirs.insert(dir_path.to_string());
+
+        // We don't need to fold children since they'll be hidden anyway
+    }
+
+    fn unfold_recursive(&mut self, parent_path: &str) {
+        // Remove the parent and all children from folded set
+        self.folded_dirs.remove(parent_path);
+
+        // Remove all paths that start with parent_path/
+        let prefix = format!("{}/", parent_path);
+        self.folded_dirs.retain(|path| !path.starts_with(&prefix));
+    }
+
+    fn get_visible_entries(&self) -> Vec<&StoredFileEntry> {
+        compute_visible_entries(&self.file_entries, &self.folded_dirs)
+    }
+
     async fn toggle_cleanup_mark(&mut self) -> Result<()> {
         if let Some(scan) = &self.current_scan {
             if let Some(selected) = self.file_list_state.selected() {
-                if let Some(entry) = self.file_entries.get(selected) {
+                let visible_entries = self.get_visible_entries();
+                if let Some(entry) = visible_entries.get(selected) {
                     self.db.mark_for_cleanup(scan.id, entry.id, None).await?;
                     self.status_message = format!("Marked '{}' for cleanup", entry.name);
                 }
@@ -1048,12 +1258,13 @@ impl App {
     }
 
     fn file_list_next(&mut self) {
-        if self.file_entries.is_empty() {
+        let visible_count = self.get_visible_entries().len();
+        if visible_count == 0 {
             return;
         }
         let i = match self.file_list_state.selected() {
             Some(i) => {
-                if i >= self.file_entries.len() - 1 {
+                if i >= visible_count - 1 {
                     0
                 } else {
                     i + 1
@@ -1065,13 +1276,14 @@ impl App {
     }
 
     fn file_list_previous(&mut self) {
-        if self.file_entries.is_empty() {
+        let visible_count = self.get_visible_entries().len();
+        if visible_count == 0 {
             return;
         }
         let i = match self.file_list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.file_entries.len() - 1
+                    visible_count - 1
                 } else {
                     i - 1
                 }
@@ -1082,28 +1294,29 @@ impl App {
     }
 
     fn file_list_top(&mut self) {
-        if !self.file_entries.is_empty() {
+        if !self.get_visible_entries().is_empty() {
             self.file_list_state.select(Some(0));
         }
     }
 
     fn file_list_bottom(&mut self) {
-        if !self.file_entries.is_empty() {
-            self.file_list_state
-                .select(Some(self.file_entries.len() - 1));
+        let visible_count = self.get_visible_entries().len();
+        if visible_count > 0 {
+            self.file_list_state.select(Some(visible_count - 1));
         }
     }
 
     fn file_list_page_down(&mut self) {
-        if self.file_entries.is_empty() {
+        let visible_count = self.get_visible_entries().len();
+        if visible_count == 0 {
             return;
         }
         let page_size = 10;
         let i = match self.file_list_state.selected() {
             Some(i) => {
                 let new_pos = i + page_size;
-                if new_pos >= self.file_entries.len() {
-                    self.file_entries.len() - 1
+                if new_pos >= visible_count {
+                    visible_count - 1
                 } else {
                     new_pos
                 }
@@ -1114,7 +1327,8 @@ impl App {
     }
 
     fn file_list_page_up(&mut self) {
-        if self.file_entries.is_empty() {
+        let visible_count = self.get_visible_entries().len();
+        if visible_count == 0 {
             return;
         }
         let page_size = 10;
@@ -1232,5 +1446,266 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Pure function to compute visible entries based on folded state
+/// This is separated from App methods to enable unit testing
+fn compute_visible_entries<'a>(
+    all_entries: &'a [StoredFileEntry],
+    folded_dirs: &std::collections::HashSet<String>,
+) -> Vec<&'a StoredFileEntry> {
+    let mut visible = Vec::new();
+
+    for entry in all_entries {
+        // Check if any parent directory is folded
+        let mut is_hidden = false;
+
+        // Check each potential parent path
+        let path_parts: Vec<&str> = entry.path.split('/').collect();
+        let mut current_path = String::new();
+
+        for (i, part) in path_parts.iter().enumerate() {
+            if i == path_parts.len() - 1 {
+                // This is the entry itself, not a parent
+                break;
+            }
+
+            if i == 0 {
+                current_path = part.to_string();
+            } else {
+                current_path = format!("{}/{}", current_path, part);
+            }
+
+            if folded_dirs.contains(&current_path) {
+                is_hidden = true;
+                break;
+            }
+        }
+
+        if !is_hidden {
+            visible.push(entry);
+        }
+    }
+
+    // Sort by path to ensure hierarchical order (parents before children)
+    // This is critical because entries from the database are sorted by size, not path
+    visible.sort_by(|a, b| a.path.cmp(&b.path));
+
+    visible
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::collections::HashSet;
+
+    fn create_test_entry(
+        id: i64,
+        path: &str,
+        name: &str,
+        depth: i64,
+        is_dir: bool,
+    ) -> StoredFileEntry {
+        StoredFileEntry {
+            id,
+            scan_id: 1,
+            path: path.to_string(),
+            name: name.to_string(),
+            parent_path: None,
+            size: 1000,
+            is_dir,
+            modified_at: Some(Utc::now()),
+            depth,
+        }
+    }
+
+    #[test]
+    fn test_visible_entries_ordering() {
+        // Create a directory structure that might expose the ordering bug
+        // /root
+        //   /root/parent
+        //     /root/parent/child1
+        //       /root/parent/child1/file.txt
+        //     /root/parent/child2
+
+        let entries = vec![
+            create_test_entry(1, "/root", "root", 0, true),
+            create_test_entry(2, "/root/parent", "parent", 1, true),
+            create_test_entry(3, "/root/parent/child1", "child1", 2, true),
+            create_test_entry(4, "/root/parent/child1/file.txt", "file.txt", 3, false),
+            create_test_entry(5, "/root/parent/child2", "child2", 2, true),
+        ];
+
+        // Start with all folders except root folded
+        let mut folded_dirs = HashSet::new();
+        folded_dirs.insert("/root/parent".to_string());
+        folded_dirs.insert("/root/parent/child1".to_string());
+        folded_dirs.insert("/root/parent/child2".to_string());
+
+        // Initially, root and parent should be visible (parent is folded but shows up with ▶)
+        // but child1, child2, and file.txt should be hidden
+        let visible = compute_visible_entries(&entries, &folded_dirs);
+        assert_eq!(
+            visible.len(),
+            2,
+            "Expected 2 visible entries (root and parent), got {} entries: {:?}",
+            visible.len(),
+            visible.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
+        assert_eq!(visible[0].path, "/root");
+        assert_eq!(visible[1].path, "/root/parent");
+
+        // Unfold parent - should show root, parent, child1 (folded), child2 (folded)
+        // but NOT file.txt (child1 is still folded)
+        folded_dirs.remove("/root/parent");
+        let visible = compute_visible_entries(&entries, &folded_dirs);
+        assert_eq!(
+            visible.len(),
+            4,
+            "Expected 4 visible entries (root, parent, child1, child2), got {} entries: {:?}",
+            visible.len(),
+            visible.iter().map(|e| &e.path).collect::<Vec<_>>()
+        ); // root, parent, child1, child2
+
+        // Check ordering: parent should come before its children
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // Find indices
+        let parent_idx = paths.iter().position(|&p| p == "/root/parent");
+        let child1_idx = paths.iter().position(|&p| p == "/root/parent/child1");
+        let child2_idx = paths.iter().position(|&p| p == "/root/parent/child2");
+
+        assert!(parent_idx.is_some(), "Parent should be visible");
+        assert!(child1_idx.is_some(), "Child1 should be visible");
+        assert!(child2_idx.is_some(), "Child2 should be visible");
+
+        // THE BUG: Parent should appear BEFORE its children in the visible list
+        assert!(
+            parent_idx.unwrap() < child1_idx.unwrap(),
+            "Parent (idx {}) should appear before child1 (idx {}), but order is: {:?}",
+            parent_idx.unwrap(),
+            child1_idx.unwrap(),
+            paths
+        );
+        assert!(
+            parent_idx.unwrap() < child2_idx.unwrap(),
+            "Parent (idx {}) should appear before child2 (idx {}), but order is: {:?}",
+            parent_idx.unwrap(),
+            child2_idx.unwrap(),
+            paths
+        );
+    }
+
+    #[test]
+    fn test_visible_entries_ordering_with_size_sorted_input() {
+        // This test reproduces the bug where entries come from database sorted by size
+        // In this case, a large child file appears before its smaller parent directory
+
+        let entries = vec![
+            create_test_entry(1, "/root", "root", 0, true),
+            // Child1 has larger size (8000) so comes first when sorted by size DESC
+            create_test_entry(3, "/root/parent/child1", "child1", 2, true),
+            // Parent has smaller size (2000) so comes second
+            create_test_entry(2, "/root/parent", "parent", 1, true),
+            // Child2 has smallest size
+            create_test_entry(4, "/root/parent/child2", "child2", 2, true),
+        ];
+
+        // Fold everything except root
+        let mut folded_dirs = HashSet::new();
+        folded_dirs.insert("/root/parent".to_string());
+        folded_dirs.insert("/root/parent/child1".to_string());
+        folded_dirs.insert("/root/parent/child2".to_string());
+
+        // Unfold parent
+        folded_dirs.remove("/root/parent");
+        let visible = compute_visible_entries(&entries, &folded_dirs);
+
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // Should be in hierarchical order: root, parent, child1, child2
+        // NOT in size order: root, child1, parent, child2
+
+        let parent_idx = paths.iter().position(|&p| p == "/root/parent").unwrap();
+        let child1_idx = paths
+            .iter()
+            .position(|&p| p == "/root/parent/child1")
+            .unwrap();
+        let child2_idx = paths
+            .iter()
+            .position(|&p| p == "/root/parent/child2")
+            .unwrap();
+
+        assert!(
+            parent_idx < child1_idx,
+            "Parent (idx {}) should appear before child1 (idx {}) in hierarchical view, but order is: {:?}",
+            parent_idx,
+            child1_idx,
+            paths
+        );
+        assert!(
+            parent_idx < child2_idx,
+            "Parent (idx {}) should appear before child2 (idx {}), but order is: {:?}",
+            parent_idx,
+            child2_idx,
+            paths
+        );
+    }
+
+    #[test]
+    fn test_visible_entries_with_complex_tree() {
+        // More complex tree to test ordering
+        let entries = vec![
+            create_test_entry(1, "/root", "root", 0, true),
+            create_test_entry(2, "/root/a", "a", 1, true),
+            create_test_entry(3, "/root/a/b", "b", 2, true),
+            create_test_entry(4, "/root/a/b/c", "c", 3, true),
+            create_test_entry(5, "/root/a/file1.txt", "file1.txt", 2, false),
+            create_test_entry(6, "/root/z", "z", 1, true),
+            create_test_entry(7, "/root/z/file2.txt", "file2.txt", 2, false),
+        ];
+
+        // Fold everything except root
+        let mut folded_dirs = HashSet::new();
+        folded_dirs.insert("/root/a".to_string());
+        folded_dirs.insert("/root/a/b".to_string());
+        folded_dirs.insert("/root/a/b/c".to_string());
+        folded_dirs.insert("/root/z".to_string());
+
+        // Unfold /root/a - should show a, b (folded), and file1.txt
+        folded_dirs.remove("/root/a");
+        let visible = compute_visible_entries(&entries, &folded_dirs);
+
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // Should contain: root, a, b (folded), file1.txt, z (folded)
+        assert!(paths.contains(&"/root"));
+        assert!(paths.contains(&"/root/a"));
+        assert!(paths.contains(&"/root/a/b"));
+        assert!(paths.contains(&"/root/a/file1.txt"));
+        assert!(paths.contains(&"/root/z"));
+
+        // Should NOT contain anything under folded directories
+        assert!(!paths.contains(&"/root/a/b/c"));
+        assert!(!paths.contains(&"/root/z/file2.txt"));
+
+        // Check ordering: each directory should appear before its children
+        let a_idx = paths.iter().position(|&p| p == "/root/a").unwrap();
+        let b_idx = paths.iter().position(|&p| p == "/root/a/b").unwrap();
+        let file1_idx = paths
+            .iter()
+            .position(|&p| p == "/root/a/file1.txt")
+            .unwrap();
+
+        assert!(
+            a_idx < b_idx,
+            "Directory /root/a should appear before /root/a/b"
+        );
+        assert!(
+            a_idx < file1_idx,
+            "Directory /root/a should appear before /root/a/file1.txt"
+        );
     }
 }
