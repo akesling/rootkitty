@@ -251,6 +251,16 @@ impl App {
                                 self.file_list_previous();
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('J') => {
+                                // Shift+J - jump to next sibling (same depth)
+                                self.file_list_next_sibling();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('K') => {
+                                // Shift+K - jump to previous sibling (same depth)
+                                self.file_list_previous_sibling();
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('d') => {
                                 // Page down
                                 self.file_list_page_down();
@@ -716,6 +726,8 @@ impl App {
             )]),
             Line::from("  j/↓         Move down one item"),
             Line::from("  k/↑         Move up one item"),
+            Line::from("  J           Jump to next sibling (same depth)"),
+            Line::from("  K           Jump to previous sibling (same depth)"),
             Line::from("  d           Page down (10 items)"),
             Line::from("  u           Page up (10 items)"),
             Line::from("  gg          Jump to top"),
@@ -1345,6 +1357,78 @@ impl App {
         self.file_list_state.select(Some(i));
     }
 
+    fn file_list_next_sibling(&mut self) {
+        let visible_entries = self.get_visible_entries();
+        if visible_entries.is_empty() {
+            return;
+        }
+
+        let current_idx = match self.file_list_state.selected() {
+            Some(i) => i,
+            None => {
+                self.file_list_state.select(Some(0));
+                return;
+            }
+        };
+
+        if let Some(current_entry) = visible_entries.get(current_idx) {
+            let current_depth = current_entry.depth;
+
+            // Find the next entry at the same depth
+            for (idx, entry) in visible_entries.iter().enumerate().skip(current_idx + 1) {
+                if entry.depth == current_depth {
+                    let entry_name = entry.name.clone();
+                    self.file_list_state.select(Some(idx));
+                    self.status_message = format!("Next sibling: {}", entry_name);
+                    return;
+                } else if entry.depth < current_depth {
+                    // We've gone back up to a parent level, no more siblings
+                    self.status_message = "No next sibling at this level".to_string();
+                    return;
+                }
+            }
+
+            self.status_message = "No next sibling at this level".to_string();
+        }
+    }
+
+    fn file_list_previous_sibling(&mut self) {
+        let visible_entries = self.get_visible_entries();
+        if visible_entries.is_empty() {
+            return;
+        }
+
+        let current_idx = match self.file_list_state.selected() {
+            Some(i) => i,
+            None => {
+                self.file_list_state.select(Some(0));
+                return;
+            }
+        };
+
+        if let Some(current_entry) = visible_entries.get(current_idx) {
+            let current_depth = current_entry.depth;
+
+            // Find the previous entry at the same depth (search backwards)
+            for idx in (0..current_idx).rev() {
+                if let Some(entry) = visible_entries.get(idx) {
+                    if entry.depth == current_depth {
+                        let entry_name = entry.name.clone();
+                        self.file_list_state.select(Some(idx));
+                        self.status_message = format!("Previous sibling: {}", entry_name);
+                        return;
+                    } else if entry.depth < current_depth {
+                        // We've gone back up to a parent level, no more siblings
+                        self.status_message = "No previous sibling at this level".to_string();
+                        return;
+                    }
+                }
+            }
+
+            self.status_message = "No previous sibling at this level".to_string();
+        }
+    }
+
     fn cleanup_list_next(&mut self) {
         if self.cleanup_items.is_empty() {
             return;
@@ -1652,6 +1736,53 @@ mod tests {
             child2_idx,
             paths
         );
+    }
+
+    #[test]
+    fn test_sibling_navigation() {
+        // Test tree structure:
+        // /root (depth 0)
+        //   /root/a (depth 1)
+        //     /root/a/file1.txt (depth 2)
+        //   /root/b (depth 1) <- sibling of 'a'
+        //   /root/c (depth 1) <- sibling of 'a' and 'b'
+        //     /root/c/d (depth 2)
+        //       /root/c/d/file2.txt (depth 3)
+
+        let entries = vec![
+            create_test_entry(1, "/root", "root", 0, true),
+            create_test_entry(2, "/root/a", "a", 1, true),
+            create_test_entry(3, "/root/a/file1.txt", "file1.txt", 2, false),
+            create_test_entry(4, "/root/b", "b", 1, true),
+            create_test_entry(5, "/root/c", "c", 1, true),
+            create_test_entry(6, "/root/c/d", "d", 2, true),
+            create_test_entry(7, "/root/c/d/file2.txt", "file2.txt", 3, false),
+        ];
+
+        let folded_dirs = HashSet::new(); // All unfolded for this test
+        let visible = compute_visible_entries(&entries, &folded_dirs);
+
+        // All entries should be visible (sorted by path)
+        assert_eq!(visible.len(), 7);
+
+        // Test depth-based sibling relationships
+        // At depth 1, we have: a, b, c (indices 1, 3, 4 in visible)
+        let a_idx = visible.iter().position(|e| e.name == "a").unwrap();
+        let b_idx = visible.iter().position(|e| e.name == "b").unwrap();
+        let c_idx = visible.iter().position(|e| e.name == "c").unwrap();
+
+        // Verify a, b, c are at depth 1
+        assert_eq!(visible[a_idx].depth, 1);
+        assert_eq!(visible[b_idx].depth, 1);
+        assert_eq!(visible[c_idx].depth, 1);
+
+        // Verify ordering: a should come before b, b before c
+        assert!(a_idx < b_idx, "a should come before b");
+        assert!(b_idx < c_idx, "b should come before c");
+
+        // Verify file1.txt is between a and b (depth 2, child of a)
+        let file1_idx = visible.iter().position(|e| e.name == "file1.txt").unwrap();
+        assert!(a_idx < file1_idx && file1_idx < b_idx);
     }
 
     #[test]

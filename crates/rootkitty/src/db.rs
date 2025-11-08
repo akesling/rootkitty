@@ -114,7 +114,11 @@ impl Database {
     }
 
     pub async fn create_scan(&self, root_path: &Path) -> Result<i64> {
-        let root_path_str = root_path.display().to_string();
+        // Canonicalize the path to store absolute paths, resolving ".", "..", "~", etc.
+        let canonical_path = root_path
+            .canonicalize()
+            .unwrap_or_else(|_| root_path.to_path_buf());
+        let root_path_str = canonical_path.display().to_string();
         let started_at = Utc::now().to_rfc3339();
 
         let result = sqlx::query(

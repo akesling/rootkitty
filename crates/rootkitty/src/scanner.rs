@@ -224,11 +224,19 @@ impl Scanner {
         let file_size = if is_dir { 0 } else { metadata.len() };
 
         let parent_path = path.parent().map(|p| p.to_path_buf());
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let name = if depth == 0 {
+            // For the root directory, use the full absolute path for clarity
+            // Canonicalize to resolve relative paths like ".", "..", "~", etc.
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+                .to_string()
+        } else {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        };
 
         let mut dir_size = file_size;
 
@@ -375,11 +383,19 @@ impl Scanner {
         let file_size = if is_dir { 0 } else { metadata.len() };
 
         let parent_path = path.parent().map(|p| p.to_path_buf());
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let name = if depth == 0 {
+            // For the root directory, use the full absolute path for clarity
+            // Canonicalize to resolve relative paths like ".", "..", "~", etc.
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+                .to_string()
+        } else {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        };
 
         let mut dir_size = file_size;
 
