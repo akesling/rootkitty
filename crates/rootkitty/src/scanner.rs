@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -29,8 +29,11 @@ pub struct ScanStats {
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
     pub files_scanned: u64,
+    #[allow(dead_code)]
     pub dirs_scanned: u64,
+    #[allow(dead_code)]
     pub total_size: u64,
+    #[allow(dead_code)]
     pub current_path: String,
     /// Currently active directories being scanned (path -> (files_done, total_files))
     pub active_dirs: Vec<(String, usize, usize)>,
@@ -44,7 +47,6 @@ const PROGRESS_UPDATE_INTERVAL: u64 = 100; // Send progress every N entries
 pub struct Scanner {
     root_path: PathBuf,
     entries: Arc<Mutex<Vec<FileEntry>>>,
-    stats: Arc<ScanStats>,
     sender: Option<mpsc::Sender<crate::db::ActorMessage>>,
     progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     entries_processed: Arc<AtomicU64>,
@@ -54,46 +56,27 @@ pub struct Scanner {
     active_workers: Arc<AtomicUsize>,
     /// If true, run a simulated demo scan instead of real filesystem scan
     demo_mode: bool,
+    /// Cancellation flag - when set to true, scanner should stop
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Scanner {
-    pub fn new<P: AsRef<Path>>(root_path: P) -> Self {
-        Self {
-            root_path: root_path.as_ref().to_path_buf(),
-            entries: Arc::new(Mutex::new(Vec::new())),
-            stats: Arc::new(ScanStats {
-                total_size: 0,
-                total_files: 0,
-                total_dirs: 0,
-            }),
-            sender: None,
-            progress_sender: None,
-            entries_processed: Arc::new(AtomicU64::new(0)),
-            active_dirs: Arc::new(Mutex::new(HashMap::new())),
-            active_workers: Arc::new(AtomicUsize::new(0)),
-            demo_mode: false,
-        }
-    }
-
     pub fn with_sender<P: AsRef<Path>>(
         root_path: P,
         sender: mpsc::Sender<crate::db::ActorMessage>,
         progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
             entries: Arc::new(Mutex::new(Vec::new())),
-            stats: Arc::new(ScanStats {
-                total_size: 0,
-                total_files: 0,
-                total_dirs: 0,
-            }),
             sender: Some(sender),
             progress_sender,
             entries_processed: Arc::new(AtomicU64::new(0)),
             active_dirs: Arc::new(Mutex::new(HashMap::new())),
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: false,
+            cancelled,
         }
     }
 
@@ -101,21 +84,18 @@ impl Scanner {
         root_path: P,
         sender: mpsc::Sender<crate::db::ActorMessage>,
         progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
             entries: Arc::new(Mutex::new(Vec::new())),
-            stats: Arc::new(ScanStats {
-                total_size: 0,
-                total_files: 0,
-                total_dirs: 0,
-            }),
             sender: Some(sender),
             progress_sender,
             entries_processed: Arc::new(AtomicU64::new(0)),
             active_dirs: Arc::new(Mutex::new(HashMap::new())),
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: true,
+            cancelled,
         }
     }
 
@@ -151,6 +131,44 @@ impl Scanner {
         Ok((entries, stats))
     }
 
+    /// Resume a scan that was previously paused, skipping already-scanned paths
+    pub fn scan_resuming(
+        &self,
+        scan_id: i64,
+        db: crate::db::Database,
+    ) -> Result<(Vec<FileEntry>, ScanStats)> {
+        let total_size = AtomicU64::new(0);
+        let total_files = AtomicU64::new(0);
+        let total_dirs = AtomicU64::new(0);
+
+        self.scan_recursive_resuming(
+            &self.root_path,
+            0,
+            &total_size,
+            &total_files,
+            &total_dirs,
+            scan_id,
+            &db,
+        )?;
+
+        // Final flush of any remaining buffered entries
+        self.flush_buffer()?;
+
+        let entries = if self.sender.is_some() {
+            Vec::new()
+        } else {
+            self.entries.lock().unwrap().clone()
+        };
+
+        let stats = ScanStats {
+            total_size: total_size.load(Ordering::Relaxed),
+            total_files: total_files.load(Ordering::Relaxed),
+            total_dirs: total_dirs.load(Ordering::Relaxed),
+        };
+
+        Ok((entries, stats))
+    }
+
     fn flush_buffer(&self) -> Result<()> {
         if let Some(sender) = &self.sender {
             let mut entries = self.entries.lock().unwrap();
@@ -162,6 +180,172 @@ impl Scanner {
         Ok(())
     }
 
+    fn scan_recursive_resuming(
+        &self,
+        path: &Path,
+        depth: usize,
+        total_size: &AtomicU64,
+        total_files: &AtomicU64,
+        total_dirs: &AtomicU64,
+        scan_id: i64,
+        db: &crate::db::Database,
+    ) -> Result<u64> {
+        // Check if scan was cancelled
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+
+        // Check if this path was already scanned
+        let path_str = path.display().to_string();
+        let already_scanned = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(db.is_path_scanned(scan_id, &path_str))
+                .unwrap_or(false)
+        });
+
+        if already_scanned {
+            // Skip this path - it was already scanned
+            return Ok(0);
+        }
+
+        let metadata = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return Ok(0), // Skip inaccessible files
+        };
+
+        let modified_at = metadata.modified().ok().and_then(|t| {
+            DateTime::from_timestamp(
+                t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64,
+                0,
+            )
+        });
+
+        let is_dir = metadata.is_dir();
+        let file_size = if is_dir { 0 } else { metadata.len() };
+
+        let parent_path = path.parent().map(|p| p.to_path_buf());
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let mut dir_size = file_size;
+
+        if is_dir {
+            total_dirs.fetch_add(1, Ordering::Relaxed);
+
+            // Read directory entries
+            let read_dir = match fs::read_dir(path) {
+                Ok(rd) => rd,
+                Err(_) => {
+                    // Still record the directory even if we can't read it
+                    self.add_entry(FileEntry {
+                        path: path.to_path_buf(),
+                        name,
+                        parent_path,
+                        size: 0,
+                        is_dir: true,
+                        modified_at,
+                        depth,
+                    });
+                    return Ok(0);
+                }
+            };
+
+            let children: Vec<_> = read_dir.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+            let num_children = children.len();
+
+            // Register this directory in active tracking
+            let dir_path_str = path.display().to_string();
+            {
+                let mut active = self.active_dirs.lock().unwrap();
+                active.insert(dir_path_str.clone(), (0, num_children));
+            }
+
+            // For small directories, process serially; for large ones, use parallelism
+            if num_children > 100 {
+                // Increment worker count for parallel processing
+                self.active_workers.fetch_add(1, Ordering::Relaxed);
+
+                let child_sizes: Vec<u64> = children
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(idx, child_path)| {
+                        let result = self
+                            .scan_recursive_resuming(
+                                child_path,
+                                depth + 1,
+                                total_size,
+                                total_files,
+                                total_dirs,
+                                scan_id,
+                                db,
+                            )
+                            .ok();
+
+                        // Update directory progress after processing each child
+                        {
+                            let mut active = self.active_dirs.lock().unwrap();
+                            if let Some(progress) = active.get_mut(&dir_path_str) {
+                                progress.0 = idx + 1;
+                            }
+                        }
+
+                        result
+                    })
+                    .collect();
+                dir_size = child_sizes.iter().sum();
+
+                // Decrement worker count
+                self.active_workers.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                for (idx, child_path) in children.iter().enumerate() {
+                    if let Ok(size) = self.scan_recursive_resuming(
+                        child_path,
+                        depth + 1,
+                        total_size,
+                        total_files,
+                        total_dirs,
+                        scan_id,
+                        db,
+                    ) {
+                        dir_size += size;
+                    }
+
+                    // Update directory progress
+                    {
+                        let mut active = self.active_dirs.lock().unwrap();
+                        if let Some(progress) = active.get_mut(&dir_path_str) {
+                            progress.0 = idx + 1;
+                        }
+                    }
+                }
+            }
+
+            // Remove this directory from active tracking
+            {
+                let mut active = self.active_dirs.lock().unwrap();
+                active.remove(&dir_path_str);
+            }
+        } else {
+            total_files.fetch_add(1, Ordering::Relaxed);
+            total_size.fetch_add(file_size, Ordering::Relaxed);
+        }
+
+        self.add_entry(FileEntry {
+            path: path.to_path_buf(),
+            name,
+            parent_path,
+            size: dir_size,
+            is_dir,
+            modified_at,
+            depth,
+        });
+
+        Ok(dir_size)
+    }
+
     fn scan_recursive(
         &self,
         path: &Path,
@@ -170,6 +354,11 @@ impl Scanner {
         total_files: &AtomicU64,
         total_dirs: &AtomicU64,
     ) -> Result<u64> {
+        // Check if scan was cancelled
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+
         let metadata = match fs::metadata(path) {
             Ok(m) => m,
             Err(_) => return Ok(0), // Skip inaccessible files
@@ -324,6 +513,10 @@ impl Scanner {
         ];
 
         for (dir_path, file_count) in demo_dirs {
+            // Check if cancelled at start of each directory
+            if self.cancelled.load(Ordering::Relaxed) {
+                break;
+            }
             // Register this directory
             {
                 let mut active = self.active_dirs.lock().unwrap();
@@ -332,6 +525,11 @@ impl Scanner {
 
             // Simulate processing files in this directory
             for i in 0..file_count {
+                // Check if cancelled
+                if self.cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 // Simulate some work
                 thread::sleep(Duration::from_millis(5));
 

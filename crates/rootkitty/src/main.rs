@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use crate::db::{ActorMessage, Database, DatabaseActor};
 use crate::scanner::{ProgressUpdate, Scanner};
 use crate::ui::App;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -126,8 +128,15 @@ async fn main() -> Result<()> {
 
             // Run demo scan (runs in blocking thread)
             let tx_clone = tx.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled_clone = cancelled.clone();
             let scan_result = tokio::task::spawn_blocking(move || {
-                let scanner = Scanner::with_sender_demo(&demo_path, tx_clone, Some(progress_tx));
+                let scanner = Scanner::with_sender_demo(
+                    &demo_path,
+                    tx_clone,
+                    Some(progress_tx),
+                    cancelled_clone,
+                );
                 scanner.scan()
             })
             .await?;
@@ -184,7 +193,7 @@ async fn main() -> Result<()> {
 
                     // Show active directories (limit to top 4 for readability)
                     let max_display = 4;
-                    for (idx, (dir_path, done, total)) in
+                    for (_idx, (dir_path, done, total)) in
                         progress.active_dirs.iter().take(max_display).enumerate()
                     {
                         let percentage = if *total > 0 {
@@ -213,8 +222,11 @@ async fn main() -> Result<()> {
             // Scan with streaming (runs in blocking thread to not block tokio runtime)
             let tx_clone = tx.clone();
             let path_clone = path.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled_clone = cancelled.clone();
             let scan_result = tokio::task::spawn_blocking(move || {
-                let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx));
+                let scanner =
+                    Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
                 scanner.scan()
             })
             .await?;
@@ -396,14 +408,5 @@ fn smart_truncate_path(path: &str, max_len: usize) -> String {
             &path[..start_len],
             &path[path.len().saturating_sub(end_len)..]
         )
-    }
-}
-
-fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        path.to_string()
-    } else {
-        let start = path.len() - max_len + 3;
-        format!("...{}", &path[start..])
     }
 }

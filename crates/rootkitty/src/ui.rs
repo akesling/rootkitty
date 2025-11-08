@@ -17,6 +17,8 @@ use std::io;
 use crate::db::{ActorMessage, Database, DatabaseActor, Scan, StoredFileEntry};
 use crate::scanner::{ProgressUpdate, Scanner};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,17 @@ struct ScanProgress {
     active_workers: usize,
 }
 
+struct ActiveScan {
+    scan_id: i64,
+    scan_handle: tokio::task::JoinHandle<
+        Result<(Vec<crate::scanner::FileEntry>, crate::scanner::ScanStats)>,
+    >,
+    actor_handle: tokio::task::JoinHandle<Result<()>>,
+    tx: mpsc::Sender<ActorMessage>,
+    progress_rx: mpsc::UnboundedReceiver<ProgressUpdate>,
+    cancelled: Arc<AtomicBool>,
+}
+
 pub struct App {
     db: Database,
     view: View,
@@ -49,6 +62,8 @@ pub struct App {
     scan_input: String,
     scan_progress: Option<ScanProgress>,
     previous_view: View,
+    /// Active scan state (if a scan is running)
+    active_scan: Option<ActiveScan>,
 }
 
 impl App {
@@ -70,6 +85,7 @@ impl App {
             scan_input: String::new(),
             scan_progress: None,
             previous_view: View::ScanList,
+            active_scan: None,
         }
     }
 
@@ -111,6 +127,24 @@ impl App {
                                 self.previous_view = View::ScanList;
                                 self.view = View::ScanDialog;
                                 self.scan_input.clear();
+                            }
+                            KeyCode::Char('r') => {
+                                // Resume paused scan
+                                if let Some(selected) = self.scan_list_state.selected() {
+                                    if let Some(scan) = self.scans.get(selected) {
+                                        if scan.status == "paused" {
+                                            let path = scan.root_path.clone();
+                                            let scan_id = scan.id;
+                                            if let Err(e) = self.resume_scan(scan_id, path).await {
+                                                self.status_message =
+                                                    format!("Resume error: {}", e);
+                                            }
+                                        } else {
+                                            self.status_message =
+                                                "Selected scan is not paused".to_string();
+                                        }
+                                    }
+                                }
                             }
                             KeyCode::Down | KeyCode::Char('j') => self.scan_list_next(),
                             KeyCode::Up | KeyCode::Char('k') => self.scan_list_previous(),
@@ -181,7 +215,7 @@ impl App {
                             KeyCode::Enter => {
                                 if !self.scan_input.is_empty() {
                                     let path = self.scan_input.clone();
-                                    if let Err(e) = self.start_scan(path, terminal).await {
+                                    if let Err(e) = self.start_scan(path).await {
                                         self.status_message = format!("Scan error: {}", e);
                                         self.view = self.previous_view;
                                     }
@@ -198,9 +232,86 @@ impl App {
                         View::Scanning => {
                             // During scanning, only allow cancel
                             if let KeyCode::Char('q') | KeyCode::Esc = key.code {
-                                self.status_message =
-                                    "Scan cancelled (not implemented yet)".to_string();
-                                // TODO: Actually cancel the scan
+                                if let Some(active_scan) = &self.active_scan {
+                                    active_scan.cancelled.store(true, Ordering::Relaxed);
+                                    self.status_message = "Cancelling scan...".to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Handle active scan updates
+            if let Some(active_scan) = &mut self.active_scan {
+                // Check for progress updates
+                match active_scan.progress_rx.try_recv() {
+                    Ok(progress) => {
+                        self.scan_progress = Some(ScanProgress {
+                            entries_scanned: progress.files_scanned,
+                            active_dirs: progress.active_dirs.clone(),
+                            active_workers: progress.active_workers,
+                        });
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No update available
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        // Scanner finished, will be handled below
+                    }
+                }
+
+                // Check if scan is complete
+                if active_scan.scan_handle.is_finished() {
+                    // Take ownership of active_scan to finalize it
+                    if let Some(active_scan) = self.active_scan.take() {
+                        // Get scan result
+                        match active_scan.scan_handle.await {
+                            Ok(Ok((_, stats))) => {
+                                // Signal actor to shutdown
+                                let _ = active_scan.tx.send(ActorMessage::Shutdown).await;
+                                drop(active_scan.tx);
+
+                                // Wait for database writes to complete
+                                if let Ok(Ok(())) = active_scan.actor_handle.await {
+                                    // Check if scan was cancelled
+                                    let was_cancelled =
+                                        active_scan.cancelled.load(Ordering::Relaxed);
+
+                                    // Save scan with appropriate status
+                                    if was_cancelled {
+                                        let _ =
+                                            self.db.pause_scan(active_scan.scan_id, &stats).await;
+                                        self.status_message = format!(
+                                            "Scan paused. Progress saved: {} files, {} dirs. Press 'r' to resume.",
+                                            stats.total_files, stats.total_dirs
+                                        );
+                                    } else {
+                                        let _ = self
+                                            .db
+                                            .complete_scan(active_scan.scan_id, &stats)
+                                            .await;
+                                        self.status_message = format!(
+                                            "Scan complete! {} files, {} dirs, {} bytes",
+                                            stats.total_files, stats.total_dirs, stats.total_size
+                                        );
+                                    }
+
+                                    // Reload scans and return to scan list
+                                    let _ = self.load_scans().await;
+                                    self.view = View::ScanList;
+                                    self.scan_progress = None;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                self.status_message = format!("Scan error: {}", e);
+                                self.view = View::ScanList;
+                                self.scan_progress = None;
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Scan join error: {}", e);
+                                self.view = View::ScanList;
+                                self.scan_progress = None;
                             }
                         }
                     }
@@ -210,20 +321,40 @@ impl App {
     }
 
     fn render(&mut self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(3)])
-            .split(f.area());
+        // For FileTree view, use 3-part layout with info pane
+        let (main_chunks, use_info_pane) = if self.view == View::FileTree {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(0),    // Main content
+                    Constraint::Length(6), // Info pane
+                    Constraint::Length(3), // Status bar
+                ])
+                .split(f.area());
+            (chunks, true)
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .split(f.area());
+            (chunks, false)
+        };
 
         match self.view {
-            View::ScanList => self.render_scan_list(f, chunks[0]),
-            View::FileTree => self.render_file_tree(f, chunks[0]),
-            View::CleanupList => self.render_cleanup_list(f, chunks[0]),
-            View::ScanDialog => self.render_scan_dialog(f, chunks[0]),
-            View::Scanning => self.render_scanning(f, chunks[0]),
+            View::ScanList => self.render_scan_list(f, main_chunks[0]),
+            View::FileTree => {
+                self.render_file_tree(f, main_chunks[0]);
+                if use_info_pane {
+                    self.render_file_info(f, main_chunks[1]);
+                }
+            }
+            View::CleanupList => self.render_cleanup_list(f, main_chunks[0]),
+            View::ScanDialog => self.render_scan_dialog(f, main_chunks[0]),
+            View::Scanning => self.render_scanning(f, main_chunks[0]),
         }
 
-        self.render_status_bar(f, chunks[1]);
+        let status_idx = if use_info_pane { 2 } else { 1 };
+        self.render_status_bar(f, main_chunks[status_idx]);
     }
 
     fn render_scan_list(&mut self, f: &mut Frame, area: Rect) {
@@ -235,6 +366,7 @@ impl App {
                 let status = match scan.status.as_str() {
                     "completed" => "✓",
                     "running" => "⟳",
+                    "paused" => "⏸",
                     _ => "✗",
                 };
                 let content = format!(
@@ -250,11 +382,9 @@ impl App {
             .collect();
 
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Scans (1) | Press Enter to view | ↑/↓ or j/k to navigate"),
-            )
+            .block(Block::default().borders(Borders::ALL).title(
+                "Scans (1) | Enter: view | r: resume paused | n: new | ↑/↓ or j/k: navigate",
+            ))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -297,6 +427,44 @@ impl App {
             .highlight_symbol(">> ");
 
         f.render_stateful_widget(list, area, &mut self.file_list_state);
+    }
+
+    fn render_file_info(&self, f: &mut Frame, area: Rect) {
+        let info_text = if let Some(selected) = self.file_list_state.selected() {
+            if let Some(entry) = self.file_entries.get(selected) {
+                let file_type = if entry.is_dir { "Directory" } else { "File" };
+                let size_str = format_size(entry.size as u64);
+
+                vec![
+                    Line::from(vec![
+                        Span::styled("Type: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(file_type),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Name: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(&entry.name),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Path: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(&entry.path),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Size: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(size_str),
+                    ]),
+                ]
+            } else {
+                vec![Line::from("No file selected")]
+            }
+        } else {
+            vec![Line::from("No file selected")]
+        };
+
+        let paragraph = Paragraph::new(info_text)
+            .block(Block::default().borders(Borders::ALL).title("File Info"))
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
     }
 
     fn render_cleanup_list(&mut self, f: &mut Frame, area: Rect) {
@@ -402,7 +570,7 @@ impl App {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from("Press q or Esc to cancel (not implemented)"));
+        lines.push(Line::from("Press q or Esc to cancel scan"));
 
         let paragraph = Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title("Scanning"))
@@ -426,7 +594,7 @@ impl App {
                 "Enter: start scan | Esc: cancel | Type path to scan"
             }
             View::Scanning => {
-                "Scanning in progress... | q/Esc: cancel"
+                "q/Esc: cancel scan"
             }
         };
 
@@ -511,12 +679,59 @@ impl App {
         Ok(())
     }
 
-    async fn start_scan(
-        &mut self,
-        path: String,
-        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<()> {
+    async fn resume_scan(&mut self, scan_id: i64, path: String) -> Result<()> {
         let path_buf = PathBuf::from(shellexpand::tilde(&path).to_string());
+
+        // Create cancellation flag
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        // Switch to scanning view
+        self.view = View::Scanning;
+        self.scan_progress = Some(ScanProgress {
+            entries_scanned: 0,
+            active_dirs: Vec::new(),
+            active_workers: 0,
+        });
+
+        // Create channels
+        let (tx, rx) = mpsc::channel(100);
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+
+        // Spawn database actor
+        let actor = DatabaseActor::new(self.db.clone(), scan_id, rx);
+        let actor_handle = tokio::spawn(async move { actor.run().await });
+
+        // Clone for the scanning thread
+        let tx_clone = tx.clone();
+        let path_clone = path_buf.clone();
+        let cancelled_clone = cancelled.clone();
+        let db_clone = self.db.clone();
+
+        // Spawn scanner in blocking thread (with resume support)
+        let scan_handle = tokio::task::spawn_blocking(move || {
+            let scanner =
+                Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
+            scanner.scan_resuming(scan_id, db_clone)
+        });
+
+        // Store active scan state
+        self.active_scan = Some(ActiveScan {
+            scan_id,
+            scan_handle,
+            actor_handle,
+            tx,
+            progress_rx,
+            cancelled,
+        });
+
+        Ok(())
+    }
+
+    async fn start_scan(&mut self, path: String) -> Result<()> {
+        let path_buf = PathBuf::from(shellexpand::tilde(&path).to_string());
+
+        // Create cancellation flag
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         // Switch to scanning view
         self.view = View::Scanning;
@@ -531,7 +746,7 @@ impl App {
 
         // Create channels
         let (tx, rx) = mpsc::channel(100);
-        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
 
         // Spawn database actor
         let actor = DatabaseActor::new(self.db.clone(), scan_id, rx);
@@ -540,64 +755,24 @@ impl App {
         // Clone for the scanning thread
         let tx_clone = tx.clone();
         let path_clone = path_buf.clone();
+        let cancelled_clone = cancelled.clone();
 
         // Spawn scanner in blocking thread
         let scan_handle = tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx));
+            let scanner =
+                Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
             scanner.scan()
         });
 
-        // Poll for progress updates and render
-        loop {
-            // Check for progress updates
-            match progress_rx.try_recv() {
-                Ok(progress) => {
-                    self.scan_progress = Some(ScanProgress {
-                        entries_scanned: progress.files_scanned,
-                        active_dirs: progress.active_dirs.clone(),
-                        active_workers: progress.active_workers,
-                    });
-                    terminal.draw(|f| self.render(f))?;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // No update available, continue
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Scanner finished
-                    break;
-                }
-            }
-
-            // Small sleep to avoid busy-waiting
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-            // Check if scan is complete
-            if scan_handle.is_finished() {
-                break;
-            }
-        }
-
-        // Get scan result
-        let (_, stats) = scan_handle.await??;
-
-        // Signal actor to shutdown
-        tx.send(ActorMessage::Shutdown).await?;
-        drop(tx);
-
-        // Wait for database writes to complete
-        actor_handle.await??;
-
-        // Complete the scan
-        self.db.complete_scan(scan_id, &stats).await?;
-
-        // Reload scans and return to scan list
-        self.load_scans().await?;
-        self.view = View::ScanList;
-        self.status_message = format!(
-            "Scan complete! {} files, {} dirs, {} bytes",
-            stats.total_files, stats.total_dirs, stats.total_size
-        );
-        self.scan_progress = None;
+        // Store active scan state
+        self.active_scan = Some(ActiveScan {
+            scan_id,
+            scan_handle,
+            actor_handle,
+            tx,
+            progress_rx,
+            cancelled,
+        });
 
         Ok(())
     }

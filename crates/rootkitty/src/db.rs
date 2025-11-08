@@ -60,12 +60,15 @@ pub struct Scan {
 #[derive(Debug, Clone)]
 pub struct StoredFileEntry {
     pub id: i64,
+    #[allow(dead_code)]
     pub scan_id: i64,
     pub path: String,
     pub name: String,
+    #[allow(dead_code)]
     pub parent_path: Option<String>,
     pub size: i64,
     pub is_dir: bool,
+    #[allow(dead_code)]
     pub modified_at: Option<DateTime<Utc>>,
     pub depth: i64,
 }
@@ -78,6 +81,7 @@ pub struct Database {
 impl Database {
     /// Create a Database from an existing pool (useful for testing)
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn from_pool(pool: SqlitePool) -> Self {
         Self { pool }
     }
@@ -139,6 +143,31 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    pub async fn pause_scan(&self, scan_id: i64, stats: &ScanStats) -> Result<()> {
+        sqlx::query(
+            "UPDATE scans SET total_size = ?, total_files = ?, total_dirs = ?, status = 'paused' WHERE id = ?"
+        )
+        .bind(stats.total_size as i64)
+        .bind(stats.total_files as i64)
+        .bind(stats.total_dirs as i64)
+        .bind(scan_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn is_path_scanned(&self, scan_id: i64, path: &str) -> Result<bool> {
+        let result =
+            sqlx::query("SELECT 1 FROM file_entries WHERE scan_id = ? AND path = ? LIMIT 1")
+                .bind(scan_id)
+                .bind(path)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(result.is_some())
     }
 
     pub async fn insert_file_entries(&self, scan_id: i64, entries: &[FileEntry]) -> Result<()> {
@@ -279,6 +308,7 @@ impl Database {
         Ok(entries)
     }
 
+    #[allow(dead_code)]
     pub async fn get_entries_by_parent(
         &self,
         scan_id: i64,
