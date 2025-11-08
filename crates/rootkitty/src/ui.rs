@@ -64,6 +64,8 @@ pub struct App {
     previous_view: View,
     /// Active scan state (if a scan is running)
     active_scan: Option<ActiveScan>,
+    /// Track if 'g' was pressed for 'gg' sequence
+    g_pressed: bool,
 }
 
 impl App {
@@ -86,6 +88,7 @@ impl App {
             scan_progress: None,
             previous_view: View::ScanList,
             active_scan: None,
+            g_pressed: false,
         }
     }
 
@@ -127,6 +130,7 @@ impl App {
                                 self.previous_view = View::ScanList;
                                 self.view = View::ScanDialog;
                                 self.scan_input.clear();
+                                self.g_pressed = false;
                             }
                             KeyCode::Char('r') => {
                                 // Resume paused scan
@@ -145,19 +149,45 @@ impl App {
                                         }
                                     }
                                 }
+                                self.g_pressed = false;
                             }
-                            KeyCode::Down | KeyCode::Char('j') => self.scan_list_next(),
-                            KeyCode::Up | KeyCode::Char('k') => self.scan_list_previous(),
+                            KeyCode::Char('g') => {
+                                if self.g_pressed {
+                                    // gg - jump to top
+                                    self.scan_list_top();
+                                    self.g_pressed = false;
+                                } else {
+                                    self.g_pressed = true;
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                // Shift+G - jump to bottom
+                                self.scan_list_bottom();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                self.scan_list_next();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                self.scan_list_previous();
+                                self.g_pressed = false;
+                            }
                             KeyCode::Enter => {
                                 if let Err(e) = self.select_scan().await {
                                     self.status_message = format!("Error: {}", e);
                                 }
+                                self.g_pressed = false;
                             }
-                            KeyCode::Char('1') => self.view = View::ScanList,
+                            KeyCode::Char('1') => {
+                                self.view = View::ScanList;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('2') => {
                                 if self.current_scan.is_some() {
                                     self.view = View::FileTree;
                                 }
+                                self.g_pressed = false;
                             }
                             KeyCode::Char('3') => {
                                 if self.current_scan.is_some() {
@@ -167,45 +197,117 @@ impl App {
                                         self.view = View::CleanupList;
                                     }
                                 }
+                                self.g_pressed = false;
                             }
-                            _ => {}
+                            _ => {
+                                self.g_pressed = false;
+                            }
                         },
                         View::FileTree => match key.code {
                             KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Down | KeyCode::Char('j') => self.file_list_next(),
-                            KeyCode::Up | KeyCode::Char('k') => self.file_list_previous(),
+                            KeyCode::Char('g') => {
+                                if self.g_pressed {
+                                    // gg - jump to top
+                                    self.file_list_top();
+                                    self.g_pressed = false;
+                                } else {
+                                    self.g_pressed = true;
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                // Shift+G - jump to bottom
+                                self.file_list_bottom();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                self.file_list_next();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                self.file_list_previous();
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char(' ') => {
                                 if let Err(e) = self.toggle_cleanup_mark().await {
                                     self.status_message = format!("Error: {}", e);
                                 }
+                                self.g_pressed = false;
                             }
-                            KeyCode::Char('1') => self.view = View::ScanList,
-                            KeyCode::Char('2') => self.view = View::FileTree,
+                            KeyCode::Char('1') => {
+                                self.view = View::ScanList;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('2') => {
+                                self.view = View::FileTree;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('3') => {
                                 if let Err(e) = self.load_cleanup_items().await {
                                     self.status_message = format!("Error: {}", e);
                                 } else {
                                     self.view = View::CleanupList;
                                 }
+                                self.g_pressed = false;
                             }
-                            _ => {}
+                            _ => {
+                                self.g_pressed = false;
+                            }
                         },
                         View::CleanupList => match key.code {
                             KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Down | KeyCode::Char('j') => self.cleanup_list_next(),
-                            KeyCode::Up | KeyCode::Char('k') => self.cleanup_list_previous(),
                             KeyCode::Char('g') => {
+                                if self.g_pressed {
+                                    // gg - jump to top
+                                    self.cleanup_list_top();
+                                    self.g_pressed = false;
+                                } else {
+                                    self.g_pressed = true;
+                                }
+                            }
+                            KeyCode::Char('G') => {
+                                // Shift+G - jump to bottom (or generate script if not using vim nav)
+                                if self.g_pressed {
+                                    // Was 'g' then 'G' - unclear intent, treat as generate
+                                    self.generate_cleanup_script();
+                                    self.g_pressed = false;
+                                } else {
+                                    self.cleanup_list_bottom();
+                                }
+                            }
+                            KeyCode::Char('s') => {
+                                // Alternative: 's' for save/script generation
                                 self.generate_cleanup_script();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                self.cleanup_list_next();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                self.cleanup_list_previous();
+                                self.g_pressed = false;
                             }
                             KeyCode::Char(' ') => {
                                 if let Err(e) = self.remove_from_cleanup().await {
                                     self.status_message = format!("Error: {}", e);
                                 }
+                                self.g_pressed = false;
                             }
-                            KeyCode::Char('1') => self.view = View::ScanList,
-                            KeyCode::Char('2') => self.view = View::FileTree,
-                            KeyCode::Char('3') => self.view = View::CleanupList,
-                            _ => {}
+                            KeyCode::Char('1') => {
+                                self.view = View::ScanList;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('2') => {
+                                self.view = View::FileTree;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('3') => {
+                                self.view = View::CleanupList;
+                                self.g_pressed = false;
+                            }
+                            _ => {
+                                self.g_pressed = false;
+                            }
                         },
                         View::ScanDialog => match key.code {
                             KeyCode::Esc => {
@@ -866,6 +968,18 @@ impl App {
         self.scan_list_state.select(Some(i));
     }
 
+    fn scan_list_top(&mut self) {
+        if !self.scans.is_empty() {
+            self.scan_list_state.select(Some(0));
+        }
+    }
+
+    fn scan_list_bottom(&mut self) {
+        if !self.scans.is_empty() {
+            self.scan_list_state.select(Some(self.scans.len() - 1));
+        }
+    }
+
     fn file_list_next(&mut self) {
         if self.file_entries.is_empty() {
             return;
@@ -900,6 +1014,19 @@ impl App {
         self.file_list_state.select(Some(i));
     }
 
+    fn file_list_top(&mut self) {
+        if !self.file_entries.is_empty() {
+            self.file_list_state.select(Some(0));
+        }
+    }
+
+    fn file_list_bottom(&mut self) {
+        if !self.file_entries.is_empty() {
+            self.file_list_state
+                .select(Some(self.file_entries.len() - 1));
+        }
+    }
+
     fn cleanup_list_next(&mut self) {
         if self.cleanup_items.is_empty() {
             return;
@@ -932,6 +1059,19 @@ impl App {
             None => 0,
         };
         self.cleanup_list_state.select(Some(i));
+    }
+
+    fn cleanup_list_top(&mut self) {
+        if !self.cleanup_items.is_empty() {
+            self.cleanup_list_state.select(Some(0));
+        }
+    }
+
+    fn cleanup_list_bottom(&mut self) {
+        if !self.cleanup_items.is_empty() {
+            self.cleanup_list_state
+                .select(Some(self.cleanup_items.len() - 1));
+        }
     }
 }
 
