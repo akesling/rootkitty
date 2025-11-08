@@ -173,6 +173,16 @@ impl App {
                                 self.scan_list_previous();
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('d') => {
+                                // Page down (Ctrl+d in vim, but using plain 'd' here)
+                                self.scan_list_page_down();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('u') => {
+                                // Page up (Ctrl+u in vim, but using plain 'u' here)
+                                self.scan_list_page_up();
+                                self.g_pressed = false;
+                            }
                             KeyCode::Enter => {
                                 if let Err(e) = self.select_scan().await {
                                     self.status_message = format!("Error: {}", e);
@@ -225,6 +235,16 @@ impl App {
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 self.file_list_previous();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('d') => {
+                                // Page down
+                                self.file_list_page_down();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('u') => {
+                                // Page up
+                                self.file_list_page_up();
                                 self.g_pressed = false;
                             }
                             KeyCode::Char(' ') => {
@@ -285,6 +305,16 @@ impl App {
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 self.cleanup_list_previous();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('d') => {
+                                // Page down
+                                self.cleanup_list_page_down();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('u') => {
+                                // Page up
+                                self.cleanup_list_page_up();
                                 self.g_pressed = false;
                             }
                             KeyCode::Char(' ') => {
@@ -980,6 +1010,43 @@ impl App {
         }
     }
 
+    fn scan_list_page_down(&mut self) {
+        if self.scans.is_empty() {
+            return;
+        }
+        let page_size = 10; // Move 10 items at a time
+        let i = match self.scan_list_state.selected() {
+            Some(i) => {
+                let new_pos = i + page_size;
+                if new_pos >= self.scans.len() {
+                    self.scans.len() - 1
+                } else {
+                    new_pos
+                }
+            }
+            None => 0,
+        };
+        self.scan_list_state.select(Some(i));
+    }
+
+    fn scan_list_page_up(&mut self) {
+        if self.scans.is_empty() {
+            return;
+        }
+        let page_size = 10; // Move 10 items at a time
+        let i = match self.scan_list_state.selected() {
+            Some(i) => {
+                if i < page_size {
+                    0
+                } else {
+                    i - page_size
+                }
+            }
+            None => 0,
+        };
+        self.scan_list_state.select(Some(i));
+    }
+
     fn file_list_next(&mut self) {
         if self.file_entries.is_empty() {
             return;
@@ -1027,6 +1094,43 @@ impl App {
         }
     }
 
+    fn file_list_page_down(&mut self) {
+        if self.file_entries.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let i = match self.file_list_state.selected() {
+            Some(i) => {
+                let new_pos = i + page_size;
+                if new_pos >= self.file_entries.len() {
+                    self.file_entries.len() - 1
+                } else {
+                    new_pos
+                }
+            }
+            None => 0,
+        };
+        self.file_list_state.select(Some(i));
+    }
+
+    fn file_list_page_up(&mut self) {
+        if self.file_entries.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let i = match self.file_list_state.selected() {
+            Some(i) => {
+                if i < page_size {
+                    0
+                } else {
+                    i - page_size
+                }
+            }
+            None => 0,
+        };
+        self.file_list_state.select(Some(i));
+    }
+
     fn cleanup_list_next(&mut self) {
         if self.cleanup_items.is_empty() {
             return;
@@ -1072,6 +1176,43 @@ impl App {
             self.cleanup_list_state
                 .select(Some(self.cleanup_items.len() - 1));
         }
+    }
+
+    fn cleanup_list_page_down(&mut self) {
+        if self.cleanup_items.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let i = match self.cleanup_list_state.selected() {
+            Some(i) => {
+                let new_pos = i + page_size;
+                if new_pos >= self.cleanup_items.len() {
+                    self.cleanup_items.len() - 1
+                } else {
+                    new_pos
+                }
+            }
+            None => 0,
+        };
+        self.cleanup_list_state.select(Some(i));
+    }
+
+    fn cleanup_list_page_up(&mut self) {
+        if self.cleanup_items.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let i = match self.cleanup_list_state.selected() {
+            Some(i) => {
+                if i < page_size {
+                    0
+                } else {
+                    i - page_size
+                }
+            }
+            None => 0,
+        };
+        self.cleanup_list_state.select(Some(i));
     }
 }
 
