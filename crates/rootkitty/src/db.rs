@@ -163,6 +163,28 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delete_scan(&self, scan_id: i64) -> Result<()> {
+        // Delete file entries first (due to foreign key constraint)
+        sqlx::query("DELETE FROM file_entries WHERE scan_id = ?")
+            .bind(scan_id)
+            .execute(&self.pool)
+            .await?;
+
+        // Delete cleanup items
+        sqlx::query("DELETE FROM cleanup_items WHERE scan_id = ?")
+            .bind(scan_id)
+            .execute(&self.pool)
+            .await?;
+
+        // Delete the scan itself
+        sqlx::query("DELETE FROM scans WHERE id = ?")
+            .bind(scan_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
     pub async fn is_path_scanned(&self, scan_id: i64, path: &str) -> Result<bool> {
         let result =
             sqlx::query("SELECT 1 FROM file_entries WHERE scan_id = ? AND path = ? LIMIT 1")

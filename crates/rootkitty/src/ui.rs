@@ -29,6 +29,8 @@ enum View {
     ScanDialog,
     Scanning,
     Help,
+    ConfirmDelete,
+    Deleting,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,12 @@ pub struct App {
     g_pressed: bool,
     /// Set of folded directory paths (absolute paths)
     folded_dirs: std::collections::HashSet<String>,
+    /// Scan ID pending deletion (for confirmation dialog)
+    delete_scan_id: Option<i64>,
+    /// Active deletion task
+    delete_task: Option<tokio::task::JoinHandle<Result<i64>>>,
+    /// Throbber frame for deletion animation
+    delete_throbber_frame: usize,
 }
 
 impl App {
@@ -93,6 +101,9 @@ impl App {
             active_scan: None,
             g_pressed: false,
             folded_dirs: std::collections::HashSet::new(),
+            delete_scan_id: None,
+            delete_task: None,
+            delete_throbber_frame: 0,
         }
     }
 
@@ -190,6 +201,17 @@ impl App {
                             KeyCode::Char('u') => {
                                 // Page up (Ctrl+u in vim, but using plain 'u' here)
                                 self.scan_list_page_up();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('x') => {
+                                // Delete scan (with confirmation)
+                                if let Some(selected) = self.scan_list_state.selected() {
+                                    if let Some(scan) = self.scans.get(selected) {
+                                        self.delete_scan_id = Some(scan.id);
+                                        self.previous_view = View::ScanList;
+                                        self.view = View::ConfirmDelete;
+                                    }
+                                }
                                 self.g_pressed = false;
                             }
                             KeyCode::Enter | KeyCode::Char('o') => {
@@ -430,6 +452,33 @@ impl App {
                                 }
                             }
                         }
+                        View::ConfirmDelete => match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                // Confirm delete - spawn background task
+                                if let Some(scan_id) = self.delete_scan_id {
+                                    let db = self.db.clone();
+                                    let delete_task = tokio::spawn(async move {
+                                        db.delete_scan(scan_id).await?;
+                                        Ok(scan_id)
+                                    });
+                                    self.delete_task = Some(delete_task);
+                                    self.view = View::Deleting;
+                                    self.delete_throbber_frame = 0;
+                                }
+                            }
+                            KeyCode::Char('n')
+                            | KeyCode::Char('N')
+                            | KeyCode::Esc
+                            | KeyCode::Char('q') => {
+                                // Cancel delete
+                                self.delete_scan_id = None;
+                                self.view = View::ScanList;
+                            }
+                            _ => {}
+                        },
+                        View::Deleting => {
+                            // No input allowed during deletion
+                        }
                     }
                 }
             }
@@ -509,6 +558,33 @@ impl App {
                     }
                 }
             }
+
+            // Handle active deletion task
+            if let Some(delete_task) = &self.delete_task {
+                if delete_task.is_finished() {
+                    // Take ownership of the task to finalize it
+                    if let Some(delete_task) = self.delete_task.take() {
+                        match delete_task.await {
+                            Ok(Ok(scan_id)) => {
+                                self.status_message = format!("Deleted scan {}", scan_id);
+                                // Reload scan list
+                                let _ = self.load_scans().await;
+                            }
+                            Ok(Err(e)) => {
+                                self.status_message = format!("Delete error: {}", e);
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Delete task error: {}", e);
+                            }
+                        }
+                        self.delete_scan_id = None;
+                        self.view = View::ScanList;
+                    }
+                } else {
+                    // Update throbber animation
+                    self.delete_throbber_frame = (self.delete_throbber_frame + 1) % 8;
+                }
+            }
         }
     }
 
@@ -544,6 +620,8 @@ impl App {
             View::ScanDialog => self.render_scan_dialog(f, main_chunks[0]),
             View::Scanning => self.render_scanning(f, main_chunks[0]),
             View::Help => self.render_help(f, main_chunks[0]),
+            View::ConfirmDelete => self.render_confirm_delete(f, main_chunks[0]),
+            View::Deleting => self.render_deleting(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -757,6 +835,7 @@ impl App {
             )]),
             Line::from("  n           New scan"),
             Line::from("  r           Resume paused scan"),
+            Line::from("  x           Delete scan (Scan list view)"),
             Line::from("  Space       Mark/unmark file for cleanup (File view)"),
             Line::from("  Space       Remove from cleanup list (Cleanup view)"),
             Line::from("  z/o         Fold/unfold directory (File view)"),
@@ -782,6 +861,94 @@ impl App {
 
         let paragraph = Paragraph::new(help_text)
             .block(Block::default().borders(Borders::ALL).title("Help (?)"))
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
+    }
+
+    fn render_confirm_delete(&self, f: &mut Frame, area: Rect) {
+        let mut lines = vec![Line::from("")];
+
+        if let Some(scan_id) = self.delete_scan_id {
+            // Find the scan in the list to show its path
+            let scan_path = self
+                .scans
+                .iter()
+                .find(|s| s.id == scan_id)
+                .map(|s| s.root_path.as_str())
+                .unwrap_or("unknown");
+
+            lines.push(Line::from(vec![Span::styled(
+                "Delete Scan?",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Scan ID: {}", scan_id)));
+            lines.push(Line::from(format!("Path: {}", scan_path)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "This will permanently delete all scan data.",
+                Style::default().fg(Color::Yellow),
+            )]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "Press Y to confirm deletion, N/Esc to cancel",
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Confirm Deletion"),
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
+    }
+
+    fn render_deleting(&self, f: &mut Frame, area: Rect) {
+        let throbber_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        let throbber = throbber_chars[self.delete_throbber_frame % throbber_chars.len()];
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                format!("{} Deleting scan...", throbber),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+        ];
+
+        if let Some(scan_id) = self.delete_scan_id {
+            // Find the scan in the list to show its path
+            let scan_path = self
+                .scans
+                .iter()
+                .find(|s| s.id == scan_id)
+                .map(|s| s.root_path.as_str())
+                .unwrap_or("unknown");
+
+            lines.push(Line::from(format!("Scan ID: {}", scan_id)));
+            lines.push(Line::from(format!("Path: {}", scan_path)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "Removing scan data from database...",
+                Style::default().fg(Color::Gray),
+            )]));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Deleting Scan"),
+            )
             .wrap(Wrap { trim: true });
 
         f.render_widget(paragraph, area);
@@ -867,6 +1034,12 @@ impl App {
             }
             View::Help => {
                 "Press any key to close help"
+            }
+            View::ConfirmDelete => {
+                "y: confirm delete | n/Esc: cancel"
+            }
+            View::Deleting => {
+                "Deleting scan, please wait..."
             }
         };
 
