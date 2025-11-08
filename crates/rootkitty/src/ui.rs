@@ -192,7 +192,7 @@ impl App {
                                 self.scan_list_page_up();
                                 self.g_pressed = false;
                             }
-                            KeyCode::Enter => {
+                            KeyCode::Enter | KeyCode::Char('o') => {
                                 if let Err(e) = self.select_scan().await {
                                     self.status_message = format!("Error: {}", e);
                                 }
@@ -224,6 +224,11 @@ impl App {
                         },
                         View::FileTree => match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Esc => {
+                                // Go back to scan list
+                                self.view = View::ScanList;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('?') => {
                                 self.previous_view = View::FileTree;
                                 self.view = View::Help;
@@ -277,12 +282,12 @@ impl App {
                                 }
                                 self.g_pressed = false;
                             }
-                            KeyCode::Char('z') => {
+                            KeyCode::Char('z') | KeyCode::Char('o') => {
                                 // Toggle fold/unfold for selected directory (one level)
                                 self.toggle_fold_directory(false);
                                 self.g_pressed = false;
                             }
-                            KeyCode::Char('Z') => {
+                            KeyCode::Char('Z') | KeyCode::Char('O') => {
                                 // Unfold all nested folders recursively
                                 self.toggle_fold_directory(true);
                                 self.g_pressed = false;
@@ -309,6 +314,11 @@ impl App {
                         },
                         View::CleanupList => match key.code {
                             KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Esc => {
+                                // Go back to scan list
+                                self.view = View::ScanList;
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('?') => {
                                 self.previous_view = View::CleanupList;
                                 self.view = View::Help;
@@ -749,10 +759,10 @@ impl App {
             Line::from("  r           Resume paused scan"),
             Line::from("  Space       Mark/unmark file for cleanup (File view)"),
             Line::from("  Space       Remove from cleanup list (Cleanup view)"),
-            Line::from("  z           Fold/unfold directory (File view)"),
-            Line::from("  Z           Unfold directory and all subdirs (File view)"),
+            Line::from("  z/o         Fold/unfold directory (File view)"),
+            Line::from("  Z/O         Unfold directory and all subdirs (File view)"),
             Line::from("  s/g         Generate cleanup script (Cleanup view)"),
-            Line::from("  Enter       Select/open"),
+            Line::from("  Enter/o     Select/open"),
             Line::from(""),
             Line::from(vec![Span::styled(
                 "General:",
