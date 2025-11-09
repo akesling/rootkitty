@@ -32,6 +32,29 @@ enum View {
     ConfirmDelete,
     Deleting,
     PreparingResume,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    BySize,
+    ByPath,
+}
+
+impl SortMode {
+    fn toggle(&self) -> Self {
+        match self {
+            SortMode::BySize => SortMode::ByPath,
+            SortMode::ByPath => SortMode::BySize,
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        match self {
+            SortMode::BySize => "By Size (Descending)",
+            SortMode::ByPath => "Alphabetical (by path)",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +109,12 @@ pub struct App {
     delete_throbber_frame: usize,
     /// Active resume preparation (loading scanned paths)
     resume_prep: Option<ResumePreparation>,
+    /// Settings list state for navigation
+    settings_list_state: ListState,
+    /// File tree sort mode
+    file_tree_sort: SortMode,
+    /// Scan list sort mode
+    scan_list_sort: SortMode,
 }
 
 impl App {
@@ -114,6 +143,9 @@ impl App {
             delete_task: None,
             delete_throbber_frame: 0,
             resume_prep: None,
+            settings_list_state: ListState::default(),
+            file_tree_sort: SortMode::ByPath,
+            scan_list_sort: SortMode::BySize,
         }
     }
 
@@ -154,6 +186,14 @@ impl App {
                             KeyCode::Char('?') => {
                                 self.previous_view = View::ScanList;
                                 self.view = View::Help;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('S') => {
+                                self.previous_view = View::ScanList;
+                                self.view = View::Settings;
+                                if self.settings_list_state.selected().is_none() {
+                                    self.settings_list_state.select(Some(0));
+                                }
                                 self.g_pressed = false;
                             }
                             KeyCode::Char('n') => {
@@ -250,6 +290,14 @@ impl App {
                                 }
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('t') => {
+                                self.scan_list_sort = self.scan_list_sort.toggle();
+                                self.status_message = format!(
+                                    "Scan list sort: {}",
+                                    self.scan_list_sort.display_name()
+                                );
+                                self.g_pressed = false;
+                            }
                             _ => {
                                 self.g_pressed = false;
                             }
@@ -338,6 +386,14 @@ impl App {
                                 } else {
                                     self.view = View::CleanupList;
                                 }
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('t') => {
+                                self.file_tree_sort = self.file_tree_sort.toggle();
+                                self.status_message = format!(
+                                    "File tree sort: {}",
+                                    self.file_tree_sort.display_name()
+                                );
                                 self.g_pressed = false;
                             }
                             _ => {
@@ -492,6 +548,23 @@ impl App {
                         View::PreparingResume => {
                             // No input allowed during preparation
                         }
+                        View::Settings => match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                self.view = self.previous_view;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                self.settings_list_next();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                self.settings_list_previous();
+                                self.g_pressed = false;
+                            }
+                            _ => {
+                                self.g_pressed = false;
+                            }
+                        },
                     }
                 }
             }
@@ -666,6 +739,7 @@ impl App {
             View::ConfirmDelete => self.render_confirm_delete(f, main_chunks[0]),
             View::Deleting => self.render_deleting(f, main_chunks[0]),
             View::PreparingResume => self.render_preparing_resume(f, main_chunks[0]),
+            View::Settings => self.render_settings(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -673,8 +747,18 @@ impl App {
     }
 
     fn render_scan_list(&mut self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .scans
+        // Sort scans based on current sort mode
+        let mut sorted_scans = self.scans.clone();
+        match self.scan_list_sort {
+            SortMode::BySize => {
+                sorted_scans.sort_by(|a, b| b.total_size.cmp(&a.total_size));
+            }
+            SortMode::ByPath => {
+                sorted_scans.sort_by(|a, b| a.root_path.cmp(&b.root_path));
+            }
+        }
+
+        let items: Vec<ListItem> = sorted_scans
             .iter()
             .map(|scan| {
                 let size_mb = scan.total_size as f64 / 1_048_576.0;
@@ -880,6 +964,7 @@ impl App {
             Line::from("  n           New scan"),
             Line::from("  r           Resume paused scan"),
             Line::from("  x           Delete scan (Scan list view)"),
+            Line::from("  t           Toggle sort mode (size/path)"),
             Line::from("  Space       Mark/unmark file for cleanup (File view)"),
             Line::from("  Space       Remove from cleanup list (Cleanup view)"),
             Line::from("  z/o         Fold/unfold directory (File view)"),
@@ -892,6 +977,7 @@ impl App {
                 Style::default().fg(Color::Yellow),
             )]),
             Line::from("  ?           Show this help"),
+            Line::from("  S           Show settings"),
             Line::from("  q           Quit / Cancel"),
             Line::from("  Esc         Cancel / Go back"),
             Line::from(""),
@@ -1040,6 +1126,61 @@ impl App {
         f.render_widget(paragraph, area);
     }
 
+    fn render_settings(&mut self, f: &mut Frame, area: Rect) {
+        // Settings items - dynamically show current sort modes
+        let settings_items = vec![
+            (
+                "Database Path",
+                "~/.config/rootkitty/rootkitty.db".to_string(),
+            ),
+            ("View Mode", "Tree View".to_string()),
+            (
+                "File Tree Sort",
+                self.file_tree_sort.display_name().to_string(),
+            ),
+            (
+                "Scan List Sort",
+                self.scan_list_sort.display_name().to_string(),
+            ),
+            ("Auto-fold Depth", "1 level".to_string()),
+            ("", "".to_string()), // Spacer
+            ("Tip", "Press 't' to toggle sort mode".to_string()),
+            ("About", "Rootkitty - Disk Usage Analyzer".to_string()),
+            ("Version", env!("CARGO_PKG_VERSION").to_string()),
+        ];
+
+        let items: Vec<ListItem> = settings_items
+            .iter()
+            .map(|(key, value)| {
+                if key.is_empty() {
+                    ListItem::new("")
+                } else {
+                    let content = if value.is_empty() {
+                        format!("{}", key)
+                    } else {
+                        format!("{}: {}", key, value)
+                    };
+                    ListItem::new(content)
+                }
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Settings (Press Shift+S to open | Esc to close)"),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ");
+
+        f.render_stateful_widget(list, area, &mut self.settings_list_state);
+    }
+
     fn render_scanning(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(""),
@@ -1104,13 +1245,13 @@ impl App {
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
         let help_text = match self.view {
             View::ScanList => {
-                "q: quit | n: new scan | 1: scans | 2: files | 3: cleanup | ↑↓/jk: navigate | Enter: select"
+                "q: quit | n: new | t: toggle sort | S: settings | 1: scans | 2: files | 3: cleanup"
             }
             View::FileTree => {
-                "q: quit | 1: scans | 2: files | 3: cleanup | Space: mark | ↑↓/jk: navigate"
+                "q: quit | t: toggle sort | S: settings | Space: mark | z: fold | ↑↓/jk: navigate"
             }
             View::CleanupList => {
-                "q: quit | 1: scans | 2: files | 3: cleanup | g: generate | Space: remove"
+                "q: quit | S: settings | 1: scans | 2: files | 3: cleanup | s: generate | Space: remove"
             }
             View::ScanDialog => {
                 "Enter: start scan | Esc: cancel | Type path to scan"
@@ -1129,6 +1270,9 @@ impl App {
             }
             View::PreparingResume => {
                 "Loading scanned paths, please wait..."
+            }
+            View::Settings => {
+                "q/Esc: close settings | ↑↓/jk: navigate"
             }
         };
 
@@ -1270,7 +1414,7 @@ impl App {
     }
 
     fn get_visible_entries(&self) -> Vec<&StoredFileEntry> {
-        compute_visible_entries(&self.file_entries, &self.folded_dirs)
+        compute_visible_entries(&self.file_entries, &self.folded_dirs, self.file_tree_sort)
     }
 
     async fn toggle_cleanup_mark(&mut self) -> Result<()> {
@@ -1826,6 +1970,37 @@ impl App {
         };
         self.cleanup_list_state.select(Some(i));
     }
+
+    fn settings_list_next(&mut self) {
+        // Settings has 9 items (0-8)
+        let num_items = 9;
+        let i = match self.settings_list_state.selected() {
+            Some(i) => {
+                if i >= num_items - 1 {
+                    0
+                } else {
+                    i + 1
+                }
+            }
+            None => 0,
+        };
+        self.settings_list_state.select(Some(i));
+    }
+
+    fn settings_list_previous(&mut self) {
+        let num_items = 9;
+        let i = match self.settings_list_state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    num_items - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.settings_list_state.select(Some(i));
+    }
 }
 
 fn format_size(bytes: u64) -> String {
@@ -1852,6 +2027,7 @@ fn format_size(bytes: u64) -> String {
 fn compute_visible_entries<'a>(
     all_entries: &'a [StoredFileEntry],
     folded_dirs: &std::collections::HashSet<String>,
+    sort_mode: SortMode,
 ) -> Vec<&'a StoredFileEntry> {
     let mut visible = Vec::new();
 
@@ -1886,11 +2062,89 @@ fn compute_visible_entries<'a>(
         }
     }
 
-    // Sort by path to ensure hierarchical order (parents before children)
-    // This is critical because entries from the database are sorted by size, not path
-    visible.sort_by(|a, b| a.path.cmp(&b.path));
+    // Sort based on the selected mode
+    match sort_mode {
+        SortMode::ByPath => {
+            // Sort by path to ensure hierarchical order (parents before children)
+            visible.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        SortMode::BySize => {
+            // Tree-based hierarchical sort: sort children by size within each parent,
+            // but keep all descendants with their parent
+            sort_hierarchically_by_size(&mut visible);
+        }
+    }
 
     visible
+}
+
+/// Sort entries hierarchically by size, maintaining tree structure
+/// This ensures that:
+/// 1. All children of a directory appear immediately after that directory
+/// 2. Within each level, siblings are sorted by size (largest first)
+fn sort_hierarchically_by_size(entries: &mut Vec<&StoredFileEntry>) {
+    // Build a mapping from path to index for quick lookups
+    let path_to_idx: std::collections::HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path.as_str(), i))
+        .collect();
+
+    // Recursively sort entries starting from each root
+    let mut sorted = Vec::new();
+    let mut processed = std::collections::HashSet::new();
+
+    // Find root entries (depth 0 or entries without parents in the list)
+    for (idx, entry) in entries.iter().enumerate() {
+        if entry.depth == 0 || entry.parent_path.is_none() {
+            sort_subtree(idx, entries, &path_to_idx, &mut sorted, &mut processed);
+        }
+    }
+
+    // Copy sorted entries back
+    for (i, entry) in sorted.iter().enumerate() {
+        entries[i] = entry;
+    }
+}
+
+/// Recursively sort a subtree by size
+fn sort_subtree<'a>(
+    idx: usize,
+    all_entries: &[&'a StoredFileEntry],
+    path_to_idx: &std::collections::HashMap<&str, usize>,
+    sorted: &mut Vec<&'a StoredFileEntry>,
+    processed: &mut std::collections::HashSet<usize>,
+) {
+    if processed.contains(&idx) {
+        return;
+    }
+
+    let entry = all_entries[idx];
+    sorted.push(entry);
+    processed.insert(idx);
+
+    // Find all children of this entry
+    let mut children_indices = Vec::new();
+    for (child_idx, child) in all_entries.iter().enumerate() {
+        if processed.contains(&child_idx) {
+            continue;
+        }
+
+        // Check if this child's parent is the current entry
+        if let Some(parent_path) = &child.parent_path {
+            if parent_path == &entry.path {
+                children_indices.push(child_idx);
+            }
+        }
+    }
+
+    // Sort children by size (descending)
+    children_indices.sort_by(|&a, &b| all_entries[b].size.cmp(&all_entries[a].size));
+
+    // Recursively process each child
+    for child_idx in children_indices {
+        sort_subtree(child_idx, all_entries, path_to_idx, sorted, processed);
+    }
 }
 
 #[cfg(test)]
@@ -1906,12 +2160,19 @@ mod tests {
         depth: i64,
         is_dir: bool,
     ) -> StoredFileEntry {
+        // Calculate parent_path from the full path
+        let parent_path = if depth > 0 {
+            path.rsplit_once('/').map(|(parent, _)| parent.to_string())
+        } else {
+            None
+        };
+
         StoredFileEntry {
             id,
             scan_id: 1,
             path: path.to_string(),
             name: name.to_string(),
-            parent_path: None,
+            parent_path,
             size: 1000,
             is_dir,
             modified_at: Some(Utc::now()),
@@ -1944,7 +2205,7 @@ mod tests {
 
         // Initially, root and parent should be visible (parent is folded but shows up with ▶)
         // but child1, child2, and file.txt should be hidden
-        let visible = compute_visible_entries(&entries, &folded_dirs);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
         assert_eq!(
             visible.len(),
             2,
@@ -1958,7 +2219,7 @@ mod tests {
         // Unfold parent - should show root, parent, child1 (folded), child2 (folded)
         // but NOT file.txt (child1 is still folded)
         folded_dirs.remove("/root/parent");
-        let visible = compute_visible_entries(&entries, &folded_dirs);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
         assert_eq!(
             visible.len(),
             4,
@@ -2019,7 +2280,7 @@ mod tests {
 
         // Unfold parent
         folded_dirs.remove("/root/parent");
-        let visible = compute_visible_entries(&entries, &folded_dirs);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
 
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
@@ -2074,7 +2335,7 @@ mod tests {
         ];
 
         let folded_dirs = HashSet::new(); // All unfolded for this test
-        let visible = compute_visible_entries(&entries, &folded_dirs);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
 
         // All entries should be visible (sorted by path)
         assert_eq!(visible.len(), 7);
@@ -2100,6 +2361,367 @@ mod tests {
     }
 
     #[test]
+    fn test_hierarchical_sort_by_size() {
+        // Test that children are kept with their parent when sorting by size
+        // Structure:
+        // /root (depth 0)
+        //   /root/big_dir (depth 1, size 1000)
+        //     /root/big_dir/file1.txt (depth 2, size 500)
+        //     /root/big_dir/file2.txt (depth 2, size 500)
+        //   /root/small_dir (depth 1, size 100)
+        //     /root/small_dir/tiny.txt (depth 2, size 100)
+        //   /root/medium_file.txt (depth 1, size 200)
+
+        let entries = vec![
+            create_test_entry(1, "/root", "root", 0, true),
+            create_test_entry(2, "/root/big_dir", "big_dir", 1, true),
+            create_test_entry(3, "/root/big_dir/file1.txt", "file1.txt", 2, false),
+            create_test_entry(4, "/root/big_dir/file2.txt", "file2.txt", 2, false),
+            create_test_entry(5, "/root/small_dir", "small_dir", 1, true),
+            create_test_entry(6, "/root/small_dir/tiny.txt", "tiny.txt", 2, false),
+            create_test_entry(7, "/root/medium_file.txt", "medium_file.txt", 1, false),
+        ];
+
+        // Manually set sizes for testing
+        let mut entries_with_size = entries.clone();
+        entries_with_size[1].size = 1000; // big_dir
+        entries_with_size[2].size = 500; // file1.txt
+        entries_with_size[3].size = 500; // file2.txt
+        entries_with_size[4].size = 100; // small_dir
+        entries_with_size[5].size = 100; // tiny.txt
+        entries_with_size[6].size = 200; // medium_file.txt
+
+        let folded_dirs = HashSet::new(); // All unfolded
+        let visible = compute_visible_entries(&entries_with_size, &folded_dirs, SortMode::BySize);
+
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // Expected order when sorted by size hierarchically:
+        // /root (always first - root)
+        // /root/big_dir (1000) - largest sibling
+        //   /root/big_dir/file1.txt (500)
+        //   /root/big_dir/file2.txt (500)
+        // /root/medium_file.txt (200) - second largest sibling
+        // /root/small_dir (100) - smallest sibling
+        //   /root/small_dir/tiny.txt (100)
+
+        assert_eq!(paths[0], "/root", "Root should be first");
+        assert_eq!(
+            paths[1], "/root/big_dir",
+            "big_dir should be second (largest child of root)"
+        );
+
+        // Children of big_dir should come before any siblings of big_dir
+        // Find where big_dir's descendants end (where we hit something that's not under /root/big_dir)
+        let big_dir_idx = paths.iter().position(|&p| p == "/root/big_dir").unwrap();
+        let big_dir_children_end = paths[big_dir_idx + 1..]
+            .iter()
+            .position(|&p| !p.starts_with("/root/big_dir/"))
+            .map(|i| i + big_dir_idx + 1)
+            .unwrap_or(paths.len());
+
+        // big_dir is at index 1, its children should be at 2 and 3, so children_end should be 4
+        assert!(
+            big_dir_children_end == 4,
+            "All children of big_dir should end at index 4, but ended at index {}",
+            big_dir_children_end
+        );
+
+        // medium_file should come after all big_dir descendants
+        let medium_idx = paths
+            .iter()
+            .position(|&p| p == "/root/medium_file.txt")
+            .unwrap();
+        let file1_idx = paths
+            .iter()
+            .position(|&p| p == "/root/big_dir/file1.txt")
+            .unwrap();
+        let file2_idx = paths
+            .iter()
+            .position(|&p| p == "/root/big_dir/file2.txt")
+            .unwrap();
+        assert!(
+            medium_idx > file1_idx,
+            "medium_file should come after big_dir's children"
+        );
+        assert!(
+            medium_idx > file2_idx,
+            "medium_file should come after big_dir's children"
+        );
+
+        // small_dir should come after medium_file (size ordering among siblings)
+        let small_dir_idx = paths.iter().position(|&p| p == "/root/small_dir").unwrap();
+        assert!(
+            small_dir_idx > medium_idx,
+            "small_dir should come after medium_file (smaller size)"
+        );
+
+        // tiny.txt should come after small_dir but before end
+        let tiny_idx = paths
+            .iter()
+            .position(|&p| p == "/root/small_dir/tiny.txt")
+            .unwrap();
+        assert!(
+            tiny_idx > small_dir_idx,
+            "tiny.txt should come after its parent small_dir"
+        );
+        assert!(tiny_idx == paths.len() - 1, "tiny.txt should be last");
+    }
+
+    // ========================================================================
+    // COMPREHENSIVE TESTING OF SORT + FOLD COMBINATIONS
+    // ========================================================================
+
+    /// Create a realistic test fixture representing a typical directory structure
+    ///
+    /// Structure:
+    /// /project (5000 bytes total)
+    ///   /project/src (3000 bytes)
+    ///     /project/src/main.rs (1000 bytes)
+    ///     /project/src/lib.rs (500 bytes)
+    ///     /project/src/utils (1500 bytes)
+    ///       /project/src/utils/helper.rs (800 bytes)
+    ///       /project/src/utils/config.rs (700 bytes)
+    ///   /project/tests (1500 bytes)
+    ///     /project/tests/integration.rs (1500 bytes)
+    ///   /project/docs (300 bytes)
+    ///     /project/docs/README.md (300 bytes)
+    ///   /project/Cargo.toml (200 bytes)
+    fn create_test_fixture() -> Vec<StoredFileEntry> {
+        vec![
+            // Root
+            create_test_entry_with_size(1, "/project", "project", 0, true, 5000),
+            // src directory (largest)
+            create_test_entry_with_size(2, "/project/src", "src", 1, true, 3000),
+            create_test_entry_with_size(3, "/project/src/main.rs", "main.rs", 2, false, 1000),
+            create_test_entry_with_size(4, "/project/src/lib.rs", "lib.rs", 2, false, 500),
+            create_test_entry_with_size(5, "/project/src/utils", "utils", 2, true, 1500),
+            create_test_entry_with_size(
+                6,
+                "/project/src/utils/helper.rs",
+                "helper.rs",
+                3,
+                false,
+                800,
+            ),
+            create_test_entry_with_size(
+                7,
+                "/project/src/utils/config.rs",
+                "config.rs",
+                3,
+                false,
+                700,
+            ),
+            // tests directory (medium)
+            create_test_entry_with_size(8, "/project/tests", "tests", 1, true, 1500),
+            create_test_entry_with_size(
+                9,
+                "/project/tests/integration.rs",
+                "integration.rs",
+                2,
+                false,
+                1500,
+            ),
+            // docs directory (small)
+            create_test_entry_with_size(10, "/project/docs", "docs", 1, true, 300),
+            create_test_entry_with_size(11, "/project/docs/README.md", "README.md", 2, false, 300),
+            // Cargo.toml (file at root, smallest)
+            create_test_entry_with_size(12, "/project/Cargo.toml", "Cargo.toml", 1, false, 200),
+        ]
+    }
+
+    fn create_test_entry_with_size(
+        id: i64,
+        path: &str,
+        name: &str,
+        depth: i64,
+        is_dir: bool,
+        size: i64,
+    ) -> StoredFileEntry {
+        let parent_path = if depth > 0 {
+            path.rsplit_once('/').map(|(parent, _)| parent.to_string())
+        } else {
+            None
+        };
+
+        StoredFileEntry {
+            id,
+            scan_id: 1,
+            path: path.to_string(),
+            name: name.to_string(),
+            parent_path,
+            size,
+            is_dir,
+            modified_at: Some(Utc::now()),
+            depth,
+        }
+    }
+
+    #[test]
+    fn test_sort_by_path_all_unfolded() {
+        let entries = create_test_fixture();
+        let folded = HashSet::new();
+
+        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath);
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // All 12 entries should be visible
+        assert_eq!(visible.len(), 12);
+
+        // Should be in alphabetical/path order
+        assert_eq!(paths[0], "/project");
+        assert_eq!(paths[1], "/project/Cargo.toml");
+        assert_eq!(paths[2], "/project/docs");
+        assert_eq!(paths[3], "/project/docs/README.md");
+        assert_eq!(paths[4], "/project/src");
+        assert_eq!(paths[5], "/project/src/lib.rs");
+        assert_eq!(paths[6], "/project/src/main.rs");
+        assert_eq!(paths[7], "/project/src/utils");
+        assert_eq!(paths[8], "/project/src/utils/config.rs");
+        assert_eq!(paths[9], "/project/src/utils/helper.rs");
+        assert_eq!(paths[10], "/project/tests");
+        assert_eq!(paths[11], "/project/tests/integration.rs");
+    }
+
+    #[test]
+    fn test_sort_by_size_all_unfolded() {
+        let entries = create_test_fixture();
+        let folded = HashSet::new();
+
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // All 12 entries should be visible
+        assert_eq!(visible.len(), 12);
+
+        // Expected order (largest to smallest within each level):
+        // /project (root)
+        //   /project/src (3000) - largest child
+        //     /project/src/main.rs (1000) - largest in src
+        //     /project/src/utils (1500) - next largest in src
+        //       /project/src/utils/helper.rs (800)
+        //       /project/src/utils/config.rs (700)
+        //     /project/src/lib.rs (500) - smallest in src
+        //   /project/tests (1500) - next largest child of project
+        //     /project/tests/integration.rs (1500)
+        //   /project/docs (300) - smaller
+        //     /project/docs/README.md (300)
+        //   /project/Cargo.toml (200) - smallest
+
+        assert_eq!(paths[0], "/project");
+        assert_eq!(
+            paths[1], "/project/src",
+            "src should be first child (largest)"
+        );
+
+        // All of src's descendants should come before tests
+        let tests_idx = paths.iter().position(|&p| p == "/project/tests").unwrap();
+        let main_idx = paths
+            .iter()
+            .position(|&p| p == "/project/src/main.rs")
+            .unwrap();
+        let utils_idx = paths
+            .iter()
+            .position(|&p| p == "/project/src/utils")
+            .unwrap();
+        let lib_idx = paths
+            .iter()
+            .position(|&p| p == "/project/src/lib.rs")
+            .unwrap();
+
+        assert!(main_idx < tests_idx, "main.rs should come before tests");
+        assert!(utils_idx < tests_idx, "utils should come before tests");
+        assert!(lib_idx < tests_idx, "lib.rs should come before tests");
+
+        // Within src's children, order should be by size: utils (1500), main.rs (1000), lib.rs (500)
+        assert!(
+            utils_idx < main_idx,
+            "utils (1500) should come before main.rs (1000)"
+        );
+        assert!(
+            main_idx < lib_idx,
+            "main.rs (1000) should come before lib.rs (500)"
+        );
+
+        // Within utils, helper.rs (800) should come before config.rs (700)
+        let helper_idx = paths
+            .iter()
+            .position(|&p| p == "/project/src/utils/helper.rs")
+            .unwrap();
+        let config_idx = paths
+            .iter()
+            .position(|&p| p == "/project/src/utils/config.rs")
+            .unwrap();
+        assert!(
+            helper_idx < config_idx,
+            "helper.rs (800) should come before config.rs (700)"
+        );
+    }
+
+    #[test]
+    fn test_sort_by_size_with_folded_dirs() {
+        let entries = create_test_fixture();
+        let mut folded = HashSet::new();
+        folded.insert("/project/src/utils".to_string());
+
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // Should see: project, src, main.rs, lib.rs, utils (folded), tests, integration.rs, docs, README.md, Cargo.toml
+        // utils children should be hidden
+        assert!(
+            !paths.contains(&"/project/src/utils/helper.rs"),
+            "helper.rs should be hidden"
+        );
+        assert!(
+            !paths.contains(&"/project/src/utils/config.rs"),
+            "config.rs should be hidden"
+        );
+        assert!(
+            paths.contains(&"/project/src/utils"),
+            "utils itself should be visible"
+        );
+
+        // Should be 10 items (12 - 2 hidden files)
+        assert_eq!(visible.len(), 10);
+    }
+
+    #[test]
+    fn test_sort_by_path_with_folded_dirs() {
+        let entries = create_test_fixture();
+        let mut folded = HashSet::new();
+        folded.insert("/project/src".to_string());
+
+        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath);
+        let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
+
+        // Should hide everything under /project/src
+        assert!(
+            paths.contains(&"/project/src"),
+            "src should be visible (just folded)"
+        );
+        assert!(
+            !paths.contains(&"/project/src/main.rs"),
+            "main.rs should be hidden"
+        );
+        assert!(
+            !paths.contains(&"/project/src/lib.rs"),
+            "lib.rs should be hidden"
+        );
+        assert!(
+            !paths.contains(&"/project/src/utils"),
+            "utils should be hidden"
+        );
+        assert!(
+            !paths.contains(&"/project/src/utils/helper.rs"),
+            "helper.rs should be hidden"
+        );
+
+        // Should be 6 items (project, src, tests, integration.rs, docs, README.md, Cargo.toml)
+        assert_eq!(visible.len(), 7);
+    }
+
+    #[test]
     fn test_visible_entries_with_complex_tree() {
         // More complex tree to test ordering
         let entries = vec![
@@ -2121,7 +2743,7 @@ mod tests {
 
         // Unfold /root/a - should show a, b (folded), and file1.txt
         folded_dirs.remove("/root/a");
-        let visible = compute_visible_entries(&entries, &folded_dirs);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
 
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
