@@ -1,5 +1,6 @@
 mod db;
 mod scanner;
+mod settings;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 
 use crate::db::{ActorMessage, Database, DatabaseActor};
 use crate::scanner::{ProgressUpdate, Scanner};
+use crate::settings::Settings;
 use crate::ui::App;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -23,6 +25,10 @@ struct Cli {
     /// Path to database file
     #[arg(short, long, default_value = "~/.config/rootkitty/rootkitty.db")]
     db: String,
+
+    /// Path to settings file
+    #[arg(short = 'c', long)]
+    config: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -64,7 +70,16 @@ async fn main() -> Result<()> {
     match cli.command {
         None => {
             // Default to TUI if no command provided
-            let mut app = App::new(db);
+            // Load settings
+            let settings_path = if let Some(config) = &cli.config {
+                PathBuf::from(shellexpand::tilde(config).to_string())
+            } else {
+                Settings::default_path()
+            };
+
+            let settings = Settings::load(&settings_path).context("Failed to load settings")?;
+
+            let mut app = App::new(db, settings, settings_path, PathBuf::from(&db_path));
             app.run().await?;
         }
         Some(Commands::DemoScan) => {
@@ -100,9 +115,7 @@ async fn main() -> Result<()> {
 
                     // Show active directories (limit to top 4 for readability)
                     let max_display = 4;
-                    for (_idx, (dir_path, done, total)) in
-                        progress.active_dirs.iter().take(max_display).enumerate()
-                    {
+                    for (dir_path, done, total) in progress.active_dirs.iter().take(max_display) {
                         let percentage = if *total > 0 {
                             (*done as f64 / *total as f64 * 100.0) as usize
                         } else {
@@ -193,9 +206,7 @@ async fn main() -> Result<()> {
 
                     // Show active directories (limit to top 4 for readability)
                     let max_display = 4;
-                    for (_idx, (dir_path, done, total)) in
-                        progress.active_dirs.iter().take(max_display).enumerate()
-                    {
+                    for (dir_path, done, total) in progress.active_dirs.iter().take(max_display) {
                         let percentage = if *total > 0 {
                             (*done as f64 / *total as f64 * 100.0) as usize
                         } else {
@@ -254,7 +265,16 @@ async fn main() -> Result<()> {
             println!("Scan {} saved to database", scan_id);
         }
         Some(Commands::Browse) => {
-            let mut app = App::new(db);
+            // Load settings
+            let settings_path = if let Some(config) = &cli.config {
+                PathBuf::from(shellexpand::tilde(config).to_string())
+            } else {
+                Settings::default_path()
+            };
+
+            let settings = Settings::load(&settings_path).context("Failed to load settings")?;
+
+            let mut app = App::new(db, settings, settings_path, PathBuf::from(&db_path));
             app.run().await?;
         }
         Some(Commands::List) => {

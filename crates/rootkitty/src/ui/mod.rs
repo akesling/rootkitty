@@ -1,8 +1,7 @@
 mod tree;
 mod types;
 
-pub use tree::SortMode;
-pub use types::View;
+pub use types::{SortMode, View};
 
 use anyhow::Result;
 use crossterm::{
@@ -22,6 +21,7 @@ use std::io;
 
 use crate::db::{ActorMessage, Database, DatabaseActor, Scan, StoredFileEntry};
 use crate::scanner::{ProgressUpdate, Scanner};
+use crate::settings::Settings;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,10 +64,24 @@ pub struct App {
     file_tree_sort: SortMode,
     /// Scan list sort mode
     scan_list_sort: SortMode,
+    /// Path to settings file for saving
+    settings_path: PathBuf,
+    /// Path to database file
+    db_path: PathBuf,
+    /// Input buffer for editing paths
+    path_input: String,
+    /// Cursor position in path input
+    path_input_cursor: usize,
+    /// Which path we're editing: 0 = config, 1 = database, None = not editing
+    editing_path_index: Option<usize>,
+    /// Pending path change awaiting confirmation (index, new_path, old_path)
+    pending_path_change: Option<(usize, PathBuf, PathBuf)>,
+    /// Whether pending path exists
+    pending_path_exists: bool,
 }
 
 impl App {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, settings: Settings, settings_path: PathBuf, db_path: PathBuf) -> Self {
         let mut scan_list_state = ListState::default();
         scan_list_state.select(Some(0));
 
@@ -93,8 +107,15 @@ impl App {
             delete_throbber_frame: 0,
             resume_prep: None,
             settings_list_state: ListState::default(),
-            file_tree_sort: SortMode::ByPath,
-            scan_list_sort: SortMode::BySize,
+            file_tree_sort: settings.ui.file_tree_sort,
+            scan_list_sort: settings.ui.scan_list_sort,
+            settings_path,
+            db_path,
+            path_input: String::new(),
+            path_input_cursor: 0,
+            editing_path_index: None,
+            pending_path_change: None,
+            pending_path_exists: false,
         }
     }
 
@@ -345,6 +366,12 @@ impl App {
                                 );
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('S') => {
+                                // Shift+S - open settings
+                                self.previous_view = View::FileTree;
+                                self.view = View::Settings;
+                                self.g_pressed = false;
+                            }
                             _ => {
                                 self.g_pressed = false;
                             }
@@ -419,6 +446,12 @@ impl App {
                             }
                             KeyCode::Char('3') => {
                                 self.view = View::CleanupList;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('S') => {
+                                // Shift+S - open settings
+                                self.previous_view = View::CleanupList;
+                                self.view = View::Settings;
                                 self.g_pressed = false;
                             }
                             _ => {
@@ -497,23 +530,285 @@ impl App {
                         View::PreparingResume => {
                             // No input allowed during preparation
                         }
-                        View::Settings => match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => {
-                                self.view = self.previous_view;
-                                self.g_pressed = false;
+                        View::ConfirmPathChange => match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                // Apply the path change
+                                if let Some((idx, new_path, _old_path)) =
+                                    self.pending_path_change.take()
+                                {
+                                    if idx == 0 {
+                                        // Config path - save current settings to new location
+                                        let current_settings = Settings {
+                                            ui: crate::settings::UiSettings {
+                                                file_tree_sort: self.file_tree_sort,
+                                                scan_list_sort: self.scan_list_sort,
+                                                auto_fold_depth: 1,
+                                            },
+                                        };
+
+                                        match current_settings.save(&new_path) {
+                                            Ok(_) => {
+                                                self.settings_path = new_path.clone();
+
+                                                // Reload settings from new path
+                                                match Settings::load(&new_path) {
+                                                    Ok(loaded_settings) => {
+                                                        self.file_tree_sort =
+                                                            loaded_settings.ui.file_tree_sort;
+                                                        self.scan_list_sort =
+                                                            loaded_settings.ui.scan_list_sort;
+                                                        self.status_message = format!(
+                                                            "Config path updated and loaded: {}",
+                                                            new_path.display()
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        self.status_message = format!(
+                                                            "Path updated but error loading: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                self.status_message =
+                                                    format!("Error saving to new path: {}", e);
+                                            }
+                                        }
+                                    } else if idx == 1 {
+                                        // Database path - just update display
+                                        self.db_path = new_path.clone();
+                                        self.status_message = format!(
+                                            "Database path updated: {} (restart required to take effect)",
+                                            new_path.display()
+                                        );
+                                    }
+                                }
+                                // Return to Settings view
+                                self.view = View::Settings;
                             }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                self.settings_list_next();
-                                self.g_pressed = false;
+                            KeyCode::Char('n')
+                            | KeyCode::Char('N')
+                            | KeyCode::Esc
+                            | KeyCode::Char('q') => {
+                                // Cancel - keep old path
+                                self.pending_path_change = None;
+                                self.status_message = "Path change cancelled".to_string();
+                                // Return to Settings view (previous_view still points to the view before Settings)
+                                self.view = View::Settings;
                             }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                self.settings_list_previous();
-                                self.g_pressed = false;
-                            }
-                            _ => {
-                                self.g_pressed = false;
-                            }
+                            _ => {}
                         },
+                        View::Settings => {
+                            if let Some(editing_idx) = self.editing_path_index {
+                                // Handle path editing mode
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        // Prepare the new path
+                                        let new_path = PathBuf::from(
+                                            shellexpand::tilde(&self.path_input).to_string(),
+                                        );
+
+                                        // Get the old path for comparison
+                                        let old_path = if editing_idx == 0 {
+                                            self.settings_path.clone()
+                                        } else {
+                                            self.db_path.clone()
+                                        };
+
+                                        // Check if path actually changed
+                                        if new_path == old_path {
+                                            self.editing_path_index = None;
+                                            self.path_input.clear();
+                                            self.path_input_cursor = 0;
+                                            self.status_message = "Path unchanged".to_string();
+                                        } else {
+                                            // Check if new path exists
+                                            let path_exists = new_path.exists();
+
+                                            // Store pending change and show confirmation dialog
+                                            self.pending_path_change =
+                                                Some((editing_idx, new_path, old_path));
+                                            self.pending_path_exists = path_exists;
+                                            // Don't change previous_view - we want to return to Settings,
+                                            // then Settings can return to wherever it came from
+                                            self.view = View::ConfirmPathChange;
+                                            self.editing_path_index = None;
+                                            self.path_input.clear();
+                                            self.path_input_cursor = 0;
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        // Cancel editing
+                                        self.editing_path_index = None;
+                                        self.path_input.clear();
+                                        self.path_input_cursor = 0;
+                                        self.status_message = "Path edit cancelled".to_string();
+                                    }
+                                    KeyCode::Left => {
+                                        // Move cursor left
+                                        if self.path_input_cursor > 0 {
+                                            self.path_input_cursor -= 1;
+                                        }
+                                    }
+                                    KeyCode::Right => {
+                                        // Move cursor right
+                                        if self.path_input_cursor < self.path_input.len() {
+                                            self.path_input_cursor += 1;
+                                        }
+                                    }
+                                    KeyCode::Home => {
+                                        // Move to start
+                                        self.path_input_cursor = 0;
+                                    }
+                                    KeyCode::End => {
+                                        // Move to end
+                                        self.path_input_cursor = self.path_input.len();
+                                    }
+                                    KeyCode::Backspace => {
+                                        // Delete character before cursor
+                                        if self.path_input_cursor > 0 {
+                                            self.path_input.remove(self.path_input_cursor - 1);
+                                            self.path_input_cursor -= 1;
+                                        }
+                                    }
+                                    KeyCode::Delete => {
+                                        // Delete character at cursor
+                                        if self.path_input_cursor < self.path_input.len() {
+                                            self.path_input.remove(self.path_input_cursor);
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        // Insert character at cursor
+                                        self.path_input.insert(self.path_input_cursor, c);
+                                        self.path_input_cursor += 1;
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                // Normal settings navigation mode
+                                match key.code {
+                                    KeyCode::Char('q') | KeyCode::Esc => {
+                                        self.view = self.previous_view;
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        self.settings_list_next();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        self.settings_list_previous();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('e') => {
+                                        // Start editing path (config or database)
+                                        if let Some(selected) = self.settings_list_state.selected()
+                                        {
+                                            if selected == 0 {
+                                                // Config path
+                                                self.editing_path_index = Some(0);
+                                                self.path_input =
+                                                    self.settings_path.display().to_string();
+                                                self.path_input_cursor = self.path_input.len();
+                                                self.status_message =
+                                                    "Editing config path...".to_string();
+                                            } else if selected == 1 {
+                                                // Database path
+                                                self.editing_path_index = Some(1);
+                                                self.path_input =
+                                                    self.db_path.display().to_string();
+                                                self.path_input_cursor = self.path_input.len();
+                                                self.status_message =
+                                                    "Editing database path (restart required)..."
+                                                        .to_string();
+                                            }
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('r') => {
+                                        // Restore path to default
+                                        if let Some(selected) = self.settings_list_state.selected()
+                                        {
+                                            if selected == 0 {
+                                                // Config path
+                                                let default_path = Settings::default_path();
+
+                                                let current_settings = Settings {
+                                                    ui: crate::settings::UiSettings {
+                                                        file_tree_sort: self.file_tree_sort,
+                                                        scan_list_sort: self.scan_list_sort,
+                                                        auto_fold_depth: 1,
+                                                    },
+                                                };
+
+                                                match current_settings.save(&default_path) {
+                                                    Ok(_) => {
+                                                        self.settings_path = default_path.clone();
+                                                        self.status_message = format!(
+                                                            "Config path restored to default: {}",
+                                                            default_path.display()
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        self.status_message = format!(
+                                                            "Error restoring to default: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            } else if selected == 1 {
+                                                // Database path - restore to CLI default
+                                                self.status_message = "Database path cannot be restored (set via --db flag)".to_string();
+                                            }
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('t') => {
+                                        // Toggle the selected setting
+                                        if let Some(selected) = self.settings_list_state.selected()
+                                        {
+                                            match selected {
+                                                3 => {
+                                                    // File Tree Sort (index 3 - after config path, db path, spacer)
+                                                    self.file_tree_sort =
+                                                        self.file_tree_sort.toggle();
+                                                    self.status_message = format!(
+                                                        "File tree sort: {}",
+                                                        self.file_tree_sort.display_name()
+                                                    );
+                                                    // Save settings to disk
+                                                    if let Err(e) = self.save_settings() {
+                                                        self.status_message =
+                                                            format!("Error saving settings: {}", e);
+                                                    }
+                                                }
+                                                4 => {
+                                                    // Scan List Sort (index 4)
+                                                    self.scan_list_sort =
+                                                        self.scan_list_sort.toggle();
+                                                    self.status_message = format!(
+                                                        "Scan list sort: {}",
+                                                        self.scan_list_sort.display_name()
+                                                    );
+                                                    // Save settings to disk
+                                                    if let Err(e) = self.save_settings() {
+                                                        self.status_message =
+                                                            format!("Error saving settings: {}", e);
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Other settings are not toggleable
+                                                }
+                                            }
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    _ => {
+                                        self.g_pressed = false;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -689,6 +984,7 @@ impl App {
             View::Deleting => self.render_deleting(f, main_chunks[0]),
             View::PreparingResume => self.render_preparing_resume(f, main_chunks[0]),
             View::Settings => self.render_settings(f, main_chunks[0]),
+            View::ConfirmPathChange => self.render_confirm_path_change(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -1033,6 +1329,73 @@ impl App {
         f.render_widget(paragraph, area);
     }
 
+    fn render_confirm_path_change(&self, f: &mut Frame, area: Rect) {
+        let mut lines = vec![Line::from("")];
+
+        if let Some((idx, new_path, old_path)) = &self.pending_path_change {
+            let path_type = if *idx == 0 { "Config" } else { "Database" };
+
+            lines.push(Line::from(vec![Span::styled(
+                format!("Change {} Path?", path_type),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Old path: {}", old_path.display())));
+            lines.push(Line::from(format!("New path: {}", new_path.display())));
+            lines.push(Line::from(""));
+
+            if self.pending_path_exists {
+                lines.push(Line::from(vec![Span::styled(
+                    "✓ File exists at new path",
+                    Style::default().fg(Color::Green),
+                )]));
+                lines.push(Line::from(""));
+                if *idx == 0 {
+                    lines.push(Line::from("Settings will be loaded from the new location."));
+                } else {
+                    lines.push(Line::from(
+                        "Note: Changing database path requires restarting the application.",
+                    ));
+                }
+            } else {
+                lines.push(Line::from(vec![Span::styled(
+                    "⚠ File does not exist at new path",
+                    Style::default().fg(Color::Red),
+                )]));
+                lines.push(Line::from(""));
+                if *idx == 0 {
+                    lines.push(Line::from(
+                        "A new config file will be created with current settings.",
+                    ));
+                } else {
+                    lines.push(Line::from(
+                        "Note: Database will need to be created after restart.",
+                    ));
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "Y: Apply change | N/Esc: Keep old path",
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Confirm Path Change"),
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
+    }
+
     fn render_preparing_resume(&self, f: &mut Frame, area: Rect) {
         let throbber_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
         let throbber = throbber_chars[self.delete_throbber_frame % throbber_chars.len()];
@@ -1077,12 +1440,28 @@ impl App {
 
     fn render_settings(&mut self, f: &mut Frame, area: Rect) {
         // Settings items - dynamically show current sort modes
+        let config_path_display = if self.editing_path_index == Some(0) {
+            // Show cursor at current position when editing config path
+            let mut display = self.path_input.clone();
+            display.insert(self.path_input_cursor, '█');
+            display
+        } else {
+            self.settings_path.display().to_string()
+        };
+
+        let db_path_display = if self.editing_path_index == Some(1) {
+            // Show cursor at current position when editing database path
+            let mut display = self.path_input.clone();
+            display.insert(self.path_input_cursor, '█');
+            display
+        } else {
+            self.db_path.display().to_string()
+        };
+
         let settings_items = vec![
-            (
-                "Database Path",
-                "~/.config/rootkitty/rootkitty.db".to_string(),
-            ),
-            ("View Mode", "Tree View".to_string()),
+            ("Config File Path", config_path_display),
+            ("Database Path", db_path_display),
+            ("", "".to_string()), // Spacer
             (
                 "File Tree Sort",
                 self.file_tree_sort.display_name().to_string(),
@@ -1093,23 +1472,52 @@ impl App {
             ),
             ("Auto-fold Depth", "1 level".to_string()),
             ("", "".to_string()), // Spacer
-            ("Tip", "Press 't' to toggle sort mode".to_string()),
             ("About", "Rootkitty - Disk Usage Analyzer".to_string()),
             ("Version", env!("CARGO_PKG_VERSION").to_string()),
         ];
 
         let items: Vec<ListItem> = settings_items
             .iter()
-            .map(|(key, value)| {
+            .enumerate()
+            .map(|(idx, (key, value))| {
                 if key.is_empty() {
                     ListItem::new("")
                 } else {
-                    let content = if value.is_empty() {
-                        format!("{}", key)
+                    // Index 0: config path (editable)
+                    // Index 1: database path (editable)
+                    // Indices 3 and 4: sort settings (toggleable)
+                    let indicator = if idx == 0 || idx == 1 {
+                        if self.editing_path_index == Some(idx) {
+                            "[editing...]"
+                        } else {
+                            "[e/r]"
+                        }
+                    } else if idx == 3 || idx == 4 {
+                        "[t]"
                     } else {
-                        format!("{}: {}", key, value)
+                        "   "
                     };
-                    ListItem::new(content)
+
+                    // Special handling when editing paths - add visual emphasis
+                    if (idx == 0 || idx == 1) && self.editing_path_index == Some(idx) {
+                        let line = Line::from(vec![
+                            Span::raw(format!("{} {}: ", indicator, key)),
+                            Span::styled(
+                                value,
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]);
+                        ListItem::new(line)
+                    } else {
+                        let content = if value.is_empty() {
+                            format!("{} {}", indicator, key)
+                        } else {
+                            format!("{} {}: {}", indicator, key, value)
+                        };
+                        ListItem::new(content)
+                    }
                 }
             })
             .collect();
@@ -1221,7 +1629,14 @@ impl App {
                 "Loading scanned paths, please wait..."
             }
             View::Settings => {
-                "q/Esc: close settings | ↑↓/jk: navigate"
+                if self.editing_path_index.is_some() {
+                    "Enter: save | Esc: cancel | ←→: move cursor | Type path"
+                } else {
+                    "q/Esc: close | t: toggle | e: edit path | r: restore default | ↑↓/jk: navigate"
+                }
+            }
+            View::ConfirmPathChange => {
+                "y: apply change | n/Esc: keep old path"
             }
         };
 
@@ -1259,6 +1674,18 @@ impl App {
         if !self.scans.is_empty() && self.scan_list_state.selected().is_none() {
             self.scan_list_state.select(Some(0));
         }
+        Ok(())
+    }
+
+    fn save_settings(&self) -> Result<()> {
+        let settings = Settings {
+            ui: crate::settings::UiSettings {
+                file_tree_sort: self.file_tree_sort,
+                scan_list_sort: self.scan_list_sort,
+                auto_fold_depth: 1, // Current default, will be configurable later
+            },
+        };
+        settings.save(&self.settings_path)?;
         Ok(())
     }
 
@@ -1664,13 +2091,7 @@ impl App {
         }
         let page_size = 10; // Move 10 items at a time
         let i = match self.scan_list_state.selected() {
-            Some(i) => {
-                if i < page_size {
-                    0
-                } else {
-                    i - page_size
-                }
-            }
+            Some(i) => i.saturating_sub(page_size),
             None => 0,
         };
         self.scan_list_state.select(Some(i));
@@ -1752,13 +2173,7 @@ impl App {
         }
         let page_size = 10;
         let i = match self.file_list_state.selected() {
-            Some(i) => {
-                if i < page_size {
-                    0
-                } else {
-                    i - page_size
-                }
-            }
+            Some(i) => i.saturating_sub(page_size),
             None => 0,
         };
         self.file_list_state.select(Some(i));
@@ -1908,13 +2323,7 @@ impl App {
         }
         let page_size = 10;
         let i = match self.cleanup_list_state.selected() {
-            Some(i) => {
-                if i < page_size {
-                    0
-                } else {
-                    i - page_size
-                }
-            }
+            Some(i) => i.saturating_sub(page_size),
             None => 0,
         };
         self.cleanup_list_state.select(Some(i));

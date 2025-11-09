@@ -3,27 +3,7 @@
 use crate::db::StoredFileEntry;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SortMode {
-    BySize,
-    ByPath,
-}
-
-impl SortMode {
-    pub fn toggle(&self) -> Self {
-        match self {
-            SortMode::BySize => SortMode::ByPath,
-            SortMode::ByPath => SortMode::BySize,
-        }
-    }
-
-    pub fn display_name(&self) -> &str {
-        match self {
-            SortMode::BySize => "By Size (Descending)",
-            SortMode::ByPath => "Alphabetical (by path)",
-        }
-    }
-}
+pub use super::types::SortMode;
 
 /// Pure function to compute visible entries based on folded state
 ///
@@ -72,10 +52,7 @@ fn is_entry_hidden(entry: &StoredFileEntry, folded_dirs: &HashSet<String>) -> bo
 }
 
 /// Sort entries based on the sort mode, maintaining tree structure
-fn sort_entries<'a>(
-    mut entries: Vec<&'a StoredFileEntry>,
-    sort_mode: SortMode,
-) -> Vec<&'a StoredFileEntry> {
+fn sort_entries(mut entries: Vec<&StoredFileEntry>, sort_mode: SortMode) -> Vec<&StoredFileEntry> {
     match sort_mode {
         SortMode::ByPath => {
             // Sort by path to ensure hierarchical order (parents before children)
@@ -115,7 +92,7 @@ fn sort_hierarchically_by_size(entries: &mut Vec<&StoredFileEntry>) {
             || entry
                 .parent_path
                 .as_ref()
-                .map_or(true, |parent| !path_to_idx.contains_key(parent.as_str()));
+                .is_none_or(|parent| !path_to_idx.contains_key(parent.as_str()));
 
         if is_root {
             sort_subtree(idx, entries, &path_to_idx, &mut sorted, &mut processed);
@@ -339,7 +316,7 @@ mod tests {
     fn test_sort_with_missing_parents() {
         // Simulate the case where we have top N entries by size, but not all parents
         // This is what happens when using get_largest_entries with a limit
-        let mut entries = vec![
+        let entries = vec![
             // Parent is NOT included (too small)
             create_test_entry_with_size(
                 1,

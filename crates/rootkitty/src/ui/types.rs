@@ -1,5 +1,30 @@
 //! Types and enums used across the UI
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortMode {
+    BySize,
+    ByPath,
+}
+
+impl SortMode {
+    pub fn toggle(&self) -> Self {
+        match self {
+            SortMode::BySize => SortMode::ByPath,
+            SortMode::ByPath => SortMode::BySize,
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        match self {
+            SortMode::BySize => "By Size (Descending)",
+            SortMode::ByPath => "Alphabetical (by path)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     ScanList,
@@ -12,6 +37,7 @@ pub enum View {
     Deleting,
     PreparingResume,
     Settings,
+    ConfirmPathChange,
 }
 
 #[derive(Debug, Clone)]
