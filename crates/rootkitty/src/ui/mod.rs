@@ -2331,8 +2331,11 @@ impl App {
 
     fn settings_list_next(&mut self) {
         // Settings has 9 items (0-8)
+        // Empty lines are at indices 2 and 6 (should be skipped)
         let num_items = 9;
-        let i = match self.settings_list_state.selected() {
+        let empty_indices = [2, 6];
+
+        let mut i = match self.settings_list_state.selected() {
             Some(i) => {
                 if i >= num_items - 1 {
                     0
@@ -2342,12 +2345,22 @@ impl App {
             }
             None => 0,
         };
+
+        // Skip empty lines
+        while empty_indices.contains(&i) {
+            i = if i >= num_items - 1 { 0 } else { i + 1 };
+        }
+
         self.settings_list_state.select(Some(i));
     }
 
     fn settings_list_previous(&mut self) {
+        // Settings has 9 items (0-8)
+        // Empty lines are at indices 2 and 6 (should be skipped)
         let num_items = 9;
-        let i = match self.settings_list_state.selected() {
+        let empty_indices = [2, 6];
+
+        let mut i = match self.settings_list_state.selected() {
             Some(i) => {
                 if i == 0 {
                     num_items - 1
@@ -2357,6 +2370,12 @@ impl App {
             }
             None => 0,
         };
+
+        // Skip empty lines
+        while empty_indices.contains(&i) {
+            i = if i == 0 { num_items - 1 } else { i - 1 };
+        }
+
         self.settings_list_state.select(Some(i));
     }
 }
