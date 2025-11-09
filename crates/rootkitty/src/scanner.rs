@@ -99,6 +99,21 @@ impl Scanner {
         }
     }
 
+    /// Simple constructor for benchmarking - collects entries in memory
+    pub fn new<P: AsRef<Path>>(root_path: P) -> Self {
+        Self {
+            root_path: root_path.as_ref().to_path_buf(),
+            entries: Arc::new(Mutex::new(Vec::new())),
+            sender: None,
+            progress_sender: None,
+            entries_processed: Arc::new(AtomicU64::new(0)),
+            active_dirs: Arc::new(Mutex::new(HashMap::new())),
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            demo_mode: false,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn scan(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
         // Check if this is a demo scan
         if self.demo_mode {
