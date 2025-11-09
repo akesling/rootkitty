@@ -3,6 +3,8 @@ use rootkitty::scanner::{ProgressUpdate, Scanner};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::fs;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -118,8 +120,9 @@ async fn test_full_scan_workflow() {
     // Perform scan in blocking thread
     let tx_clone = tx.clone();
     let path_clone = temp_fs.path().to_path_buf();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let scan_result = tokio::task::spawn_blocking(move || {
-        let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx));
+        let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled);
         scanner.scan()
     })
     .await
@@ -186,13 +189,15 @@ async fn test_concurrent_scans() {
     let path1 = temp_fs1.path().to_path_buf();
     let path2 = temp_fs2.path().to_path_buf();
 
+    let cancelled1 = Arc::new(AtomicBool::new(false));
+    let cancelled2 = Arc::new(AtomicBool::new(false));
     let (result1, result2) = tokio::join!(
         tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::with_sender(&path1, tx1, None);
+            let scanner = Scanner::with_sender(&path1, tx1, None, cancelled1);
             scanner.scan()
         }),
         tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::with_sender(&path2, tx2, None);
+            let scanner = Scanner::with_sender(&path2, tx2, None, cancelled2);
             scanner.scan()
         })
     );
@@ -233,8 +238,9 @@ async fn test_cleanup_workflow() {
     let actor_handle = tokio::spawn(async move { actor.run().await });
 
     let path_clone = temp_fs.path().to_path_buf();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let scan_result = tokio::task::spawn_blocking(move || {
-        let scanner = Scanner::with_sender(&path_clone, tx, None);
+        let scanner = Scanner::with_sender(&path_clone, tx, None, cancelled);
         scanner.scan()
     })
     .await
@@ -296,8 +302,9 @@ async fn test_large_batch_processing() {
     let actor_handle = tokio::spawn(async move { actor.run().await });
 
     let path_clone = root.to_path_buf();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let scan_result = tokio::task::spawn_blocking(move || {
-        let scanner = Scanner::with_sender(&path_clone, tx, None);
+        let scanner = Scanner::with_sender(&path_clone, tx, None, cancelled);
         scanner.scan()
     })
     .await

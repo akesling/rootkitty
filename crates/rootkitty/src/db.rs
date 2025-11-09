@@ -163,6 +163,47 @@ impl Database {
         Ok(())
     }
 
+    /// Calculate scan statistics from file_entries in the database
+    /// Useful for recovering stats from interrupted scans
+    pub async fn calculate_scan_stats(&self, scan_id: i64) -> Result<ScanStats> {
+        let row = sqlx::query(
+            "SELECT
+                COALESCE(SUM(size), 0) as total_size,
+                COALESCE(SUM(CASE WHEN is_dir = 0 THEN 1 ELSE 0 END), 0) as total_files,
+                COALESCE(SUM(CASE WHEN is_dir = 1 THEN 1 ELSE 0 END), 0) as total_dirs
+             FROM file_entries
+             WHERE scan_id = ?",
+        )
+        .bind(scan_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(ScanStats {
+            total_size: row.get::<i64, _>("total_size") as u64,
+            total_files: row.get::<i64, _>("total_files") as u64,
+            total_dirs: row.get::<i64, _>("total_dirs") as u64,
+        })
+    }
+
+    /// Get all scanned paths for a given scan_id
+    /// Used to skip already-scanned paths when resuming
+    pub async fn get_scanned_paths(
+        &self,
+        scan_id: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query("SELECT path FROM file_entries WHERE scan_id = ?")
+            .bind(scan_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+        let paths = rows
+            .iter()
+            .map(|row| row.get::<String, _>("path"))
+            .collect();
+
+        Ok(paths)
+    }
+
     pub async fn delete_scan(&self, scan_id: i64) -> Result<()> {
         // Delete file entries first (due to foreign key constraint)
         sqlx::query("DELETE FROM file_entries WHERE scan_id = ?")
@@ -185,6 +226,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn is_path_scanned(&self, scan_id: i64, path: &str) -> Result<bool> {
         let result =
             sqlx::query("SELECT 1 FROM file_entries WHERE scan_id = ? AND path = ? LIMIT 1")
@@ -483,7 +525,7 @@ mod tests {
                 total_size INTEGER NOT NULL DEFAULT 0,
                 total_files INTEGER NOT NULL DEFAULT 0,
                 total_dirs INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed'))
+                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'paused'))
             );
             CREATE INDEX idx_scans_started_at ON scans(started_at DESC);
             CREATE INDEX idx_scans_root_path ON scans(root_path);
@@ -702,5 +744,68 @@ mod tests {
         let stored = db.get_largest_entries(scan_id, 10).await.unwrap();
         assert_eq!(stored.len(), 10);
         assert_eq!(stored[0].size, 999); // Largest should be first
+    }
+
+    #[tokio::test]
+    async fn test_calculate_scan_stats() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test");
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        // Insert some test entries
+        let entries = vec![
+            create_test_entry("file1.txt", 100, false),
+            create_test_entry("file2.txt", 200, false),
+            create_test_entry("file3.txt", 300, false),
+            create_test_entry("dir1", 0, true),
+            create_test_entry("dir2", 0, true),
+        ];
+        db.insert_file_entries(scan_id, &entries).await.unwrap();
+
+        // Calculate stats from database
+        let stats = db.calculate_scan_stats(scan_id).await.unwrap();
+
+        assert_eq!(stats.total_files, 3);
+        assert_eq!(stats.total_dirs, 2);
+        assert_eq!(stats.total_size, 600); // 100 + 200 + 300
+    }
+
+    #[tokio::test]
+    async fn test_orphaned_scan_recovery() {
+        let db = create_test_db().await;
+        let path = PathBuf::from("/test");
+        let scan_id = db.create_scan(&path).await.unwrap();
+
+        // Verify scan starts as "running"
+        let scan = db.get_scan(scan_id).await.unwrap().unwrap();
+        assert_eq!(scan.status, "running");
+        assert_eq!(scan.total_files, 0);
+        assert_eq!(scan.total_dirs, 0);
+
+        // Simulate a scan that was interrupted - it has file entries but status is still "running"
+        let entries = vec![
+            create_test_entry("file1.txt", 1024, false),
+            create_test_entry("file2.txt", 2048, false),
+            create_test_entry("dir1", 0, true),
+        ];
+        db.insert_file_entries(scan_id, &entries).await.unwrap();
+
+        // Simulate what UI does on load: detect orphaned scan and recover it
+        let scans = db.list_scans().await.unwrap();
+        for scan in &scans {
+            if scan.status == "running" && scan.completed_at.is_none() {
+                // Calculate stats from what's already been scanned
+                let stats = db.calculate_scan_stats(scan.id).await.unwrap();
+                db.pause_scan(scan.id, &stats).await.unwrap();
+            }
+        }
+
+        // Verify the scan is now paused with correct stats
+        let scan = db.get_scan(scan_id).await.unwrap().unwrap();
+        assert_eq!(scan.status, "paused");
+        assert_eq!(scan.total_files, 2);
+        assert_eq!(scan.total_dirs, 1);
+        assert_eq!(scan.total_size, 3072); // 1024 + 2048
+        assert!(scan.completed_at.is_none());
     }
 }

@@ -31,6 +31,7 @@ enum View {
     Help,
     ConfirmDelete,
     Deleting,
+    PreparingResume,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,12 @@ struct ActiveScan {
     tx: mpsc::Sender<ActorMessage>,
     progress_rx: mpsc::UnboundedReceiver<ProgressUpdate>,
     cancelled: Arc<AtomicBool>,
+}
+
+struct ResumePreparation {
+    scan_id: i64,
+    path: String,
+    load_task: tokio::task::JoinHandle<Result<std::collections::HashSet<String>>>,
 }
 
 pub struct App {
@@ -77,6 +84,8 @@ pub struct App {
     delete_task: Option<tokio::task::JoinHandle<Result<i64>>>,
     /// Throbber frame for deletion animation
     delete_throbber_frame: usize,
+    /// Active resume preparation (loading scanned paths)
+    resume_prep: Option<ResumePreparation>,
 }
 
 impl App {
@@ -104,6 +113,7 @@ impl App {
             delete_scan_id: None,
             delete_task: None,
             delete_throbber_frame: 0,
+            resume_prep: None,
         }
     }
 
@@ -479,6 +489,9 @@ impl App {
                         View::Deleting => {
                             // No input allowed during deletion
                         }
+                        View::PreparingResume => {
+                            // No input allowed during preparation
+                        }
                     }
                 }
             }
@@ -585,6 +598,36 @@ impl App {
                     self.delete_throbber_frame = (self.delete_throbber_frame + 1) % 8;
                 }
             }
+
+            // Handle resume preparation (loading scanned paths)
+            if let Some(resume_prep) = &self.resume_prep {
+                if resume_prep.load_task.is_finished() {
+                    // Take ownership to finalize
+                    if let Some(resume_prep) = self.resume_prep.take() {
+                        match resume_prep.load_task.await {
+                            Ok(Ok(scanned_paths)) => {
+                                // Paths loaded successfully, now start the actual scan
+                                let _ = self
+                                    .start_resume_scan_with_paths(
+                                        resume_prep.scan_id,
+                                        resume_prep.path,
+                                        scanned_paths,
+                                    )
+                                    .await;
+                            }
+                            Ok(Err(e)) => {
+                                self.status_message = format!("Error loading scan paths: {}", e);
+                                self.view = View::ScanList;
+                            }
+                            Err(e) => {
+                                self.status_message =
+                                    format!("Resume preparation task error: {}", e);
+                                self.view = View::ScanList;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -622,6 +665,7 @@ impl App {
             View::Help => self.render_help(f, main_chunks[0]),
             View::ConfirmDelete => self.render_confirm_delete(f, main_chunks[0]),
             View::Deleting => self.render_deleting(f, main_chunks[0]),
+            View::PreparingResume => self.render_preparing_resume(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -954,6 +998,48 @@ impl App {
         f.render_widget(paragraph, area);
     }
 
+    fn render_preparing_resume(&self, f: &mut Frame, area: Rect) {
+        let throbber_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        let throbber = throbber_chars[self.delete_throbber_frame % throbber_chars.len()];
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                format!("{} Preparing to resume scan...", throbber),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+        ];
+
+        if let Some(resume_prep) = &self.resume_prep {
+            lines.push(Line::from(format!("Scan ID: {}", resume_prep.scan_id)));
+            lines.push(Line::from(format!("Path: {}", resume_prep.path)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "Loading already-scanned paths from database...",
+                Style::default().fg(Color::Gray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "This may take a moment for large scans.",
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            )]));
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Preparing Resume"),
+            )
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(paragraph, area);
+    }
+
     fn render_scanning(&self, f: &mut Frame, area: Rect) {
         let mut lines = vec![
             Line::from(""),
@@ -1041,6 +1127,9 @@ impl App {
             View::Deleting => {
                 "Deleting scan, please wait..."
             }
+            View::PreparingResume => {
+                "Loading scanned paths, please wait..."
+            }
         };
 
         let text = vec![
@@ -1060,6 +1149,20 @@ impl App {
 
     async fn load_scans(&mut self) -> Result<()> {
         self.scans = self.db.list_scans().await?;
+
+        // Fix up any orphaned "running" scans (from Ctrl+C or crashes)
+        // These should be marked as "paused" so they can be resumed
+        for scan in &self.scans {
+            if scan.status == "running" && scan.completed_at.is_none() {
+                // Calculate stats from what's already been scanned and saved to the database
+                let stats = self.db.calculate_scan_stats(scan.id).await?;
+                let _ = self.db.pause_scan(scan.id, &stats).await;
+            }
+        }
+
+        // Reload after fixing up statuses
+        self.scans = self.db.list_scans().await?;
+
         if !self.scans.is_empty() && self.scan_list_state.selected().is_none() {
             self.scan_list_state.select(Some(0));
         }
@@ -1217,6 +1320,30 @@ impl App {
     }
 
     async fn resume_scan(&mut self, scan_id: i64, path: String) -> Result<()> {
+        // Show loading message and switch to preparing view
+        self.status_message = "Loading already-scanned paths from database...".to_string();
+        self.view = View::PreparingResume;
+
+        // Start loading scanned paths in background (non-blocking)
+        let db_clone = self.db.clone();
+        let load_task = tokio::spawn(async move { db_clone.get_scanned_paths(scan_id).await });
+
+        // Store the preparation state
+        self.resume_prep = Some(ResumePreparation {
+            scan_id,
+            path,
+            load_task,
+        });
+
+        Ok(())
+    }
+
+    async fn start_resume_scan_with_paths(
+        &mut self,
+        scan_id: i64,
+        path: String,
+        scanned_paths: std::collections::HashSet<String>,
+    ) -> Result<()> {
         let path_buf = PathBuf::from(shellexpand::tilde(&path).to_string());
 
         // Create cancellation flag
@@ -1230,6 +1357,11 @@ impl App {
             active_workers: 0,
         });
 
+        self.status_message = format!(
+            "Resuming scan, skipping {} already-scanned paths...",
+            scanned_paths.len()
+        );
+
         // Create channels
         let (tx, rx) = mpsc::channel(100);
         let (progress_tx, progress_rx) = mpsc::unbounded_channel::<ProgressUpdate>();
@@ -1242,13 +1374,12 @@ impl App {
         let tx_clone = tx.clone();
         let path_clone = path_buf.clone();
         let cancelled_clone = cancelled.clone();
-        let db_clone = self.db.clone();
 
         // Spawn scanner in blocking thread (with resume support)
         let scan_handle = tokio::task::spawn_blocking(move || {
             let scanner =
                 Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
-            scanner.scan_resuming(scan_id, db_clone)
+            scanner.scan_resuming(scanned_paths)
         });
 
         // Store active scan state

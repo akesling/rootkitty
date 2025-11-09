@@ -132,10 +132,10 @@ impl Scanner {
     }
 
     /// Resume a scan that was previously paused, skipping already-scanned paths
+    /// The `scanned_paths` HashSet contains paths that have already been scanned
     pub fn scan_resuming(
         &self,
-        scan_id: i64,
-        db: crate::db::Database,
+        scanned_paths: std::collections::HashSet<String>,
     ) -> Result<(Vec<FileEntry>, ScanStats)> {
         let total_size = AtomicU64::new(0);
         let total_files = AtomicU64::new(0);
@@ -147,8 +147,7 @@ impl Scanner {
             &total_size,
             &total_files,
             &total_dirs,
-            scan_id,
-            &db,
+            &scanned_paths,
         )?;
 
         // Final flush of any remaining buffered entries
@@ -187,8 +186,7 @@ impl Scanner {
         total_size: &AtomicU64,
         total_files: &AtomicU64,
         total_dirs: &AtomicU64,
-        scan_id: i64,
-        db: &crate::db::Database,
+        scanned_paths: &std::collections::HashSet<String>,
     ) -> Result<u64> {
         // Check if scan was cancelled
         if self.cancelled.load(Ordering::Relaxed) {
@@ -197,13 +195,7 @@ impl Scanner {
 
         // Check if this path was already scanned
         let path_str = path.display().to_string();
-        let already_scanned = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(db.is_path_scanned(scan_id, &path_str))
-                .unwrap_or(false)
-        });
-
-        if already_scanned {
+        if scanned_paths.contains(&path_str) {
             // Skip this path - it was already scanned
             return Ok(0);
         }
@@ -287,8 +279,7 @@ impl Scanner {
                                 total_size,
                                 total_files,
                                 total_dirs,
-                                scan_id,
-                                db,
+                                scanned_paths,
                             )
                             .ok();
 
@@ -315,8 +306,7 @@ impl Scanner {
                         total_size,
                         total_files,
                         total_dirs,
-                        scan_id,
-                        db,
+                        scanned_paths,
                     ) {
                         dir_size += size;
                     }
