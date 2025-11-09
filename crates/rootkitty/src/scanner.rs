@@ -44,6 +44,15 @@ pub struct ProgressUpdate {
 const BUFFER_SIZE: usize = 1000;
 const PROGRESS_UPDATE_INTERVAL: u64 = 100; // Send progress every N entries
 
+/// Scanning implementation to use
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScannerImpl {
+    /// Custom rayon-based parallel implementation
+    Custom,
+    /// walkdir-based single-threaded implementation
+    Walkdir,
+}
+
 pub struct Scanner {
     root_path: PathBuf,
     entries: Arc<Mutex<Vec<FileEntry>>>,
@@ -58,6 +67,8 @@ pub struct Scanner {
     demo_mode: bool,
     /// Cancellation flag - when set to true, scanner should stop
     cancelled: Arc<AtomicBool>,
+    /// Implementation to use for scanning
+    implementation: ScannerImpl,
 }
 
 impl Scanner {
@@ -77,6 +88,7 @@ impl Scanner {
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: false,
             cancelled,
+            implementation: ScannerImpl::Custom,
         }
     }
 
@@ -96,11 +108,18 @@ impl Scanner {
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: true,
             cancelled,
+            implementation: ScannerImpl::Custom,
         }
     }
 
     /// Simple constructor for benchmarking - collects entries in memory
+    /// Uses the custom rayon-based parallel implementation by default
     pub fn new<P: AsRef<Path>>(root_path: P) -> Self {
+        Self::new_with_impl(root_path, ScannerImpl::Custom)
+    }
+
+    /// Constructor for benchmarking with a specific implementation
+    pub fn new_with_impl<P: AsRef<Path>>(root_path: P, implementation: ScannerImpl) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
             entries: Arc::new(Mutex::new(Vec::new())),
@@ -111,6 +130,7 @@ impl Scanner {
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: false,
             cancelled: Arc::new(AtomicBool::new(false)),
+            implementation,
         }
     }
 
@@ -120,6 +140,14 @@ impl Scanner {
             return self.demo_scan();
         }
 
+        // Dispatch based on implementation
+        match self.implementation {
+            ScannerImpl::Custom => self.scan_custom(),
+            ScannerImpl::Walkdir => self.scan_walkdir(),
+        }
+    }
+
+    fn scan_custom(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
         let total_size = AtomicU64::new(0);
         let total_files = AtomicU64::new(0);
         let total_dirs = AtomicU64::new(0);
@@ -142,6 +170,96 @@ impl Scanner {
             total_files: total_files.load(Ordering::Relaxed),
             total_dirs: total_dirs.load(Ordering::Relaxed),
         };
+
+        Ok((entries, stats))
+    }
+
+    fn scan_walkdir(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
+        use walkdir::WalkDir;
+
+        let mut total_size = 0u64;
+        let mut total_files = 0u64;
+        let mut total_dirs = 0u64;
+
+        // Build a map to track directory sizes
+        let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
+        let mut entries = Vec::new();
+
+        // First pass: collect all entries and calculate file sizes
+        let walker = WalkDir::new(&self.root_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok());
+
+        for entry in walker {
+            if self.cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Scan cancelled"));
+            }
+
+            let path = entry.path().to_path_buf();
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let is_dir = metadata.is_dir();
+            let file_size = if is_dir { 0 } else { metadata.len() };
+
+            if is_dir {
+                total_dirs += 1;
+                dir_sizes.insert(path.clone(), 0);
+            } else {
+                total_files += 1;
+                total_size += file_size;
+
+                // Add file size to all parent directories
+                let mut current_parent = path.parent();
+                while let Some(parent) = current_parent {
+                    *dir_sizes.entry(parent.to_path_buf()).or_insert(0) += file_size;
+                    current_parent = parent.parent();
+                }
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let parent_path = path.parent().map(|p| p.to_path_buf());
+            let modified_at = metadata.modified().ok().map(|t| {
+                let system_time: std::time::SystemTime = t;
+                DateTime::<Utc>::from(system_time)
+            });
+            let depth = entry.depth();
+
+            entries.push(FileEntry {
+                path: path.clone(),
+                name,
+                parent_path,
+                size: if is_dir {
+                    *dir_sizes.get(&path).unwrap_or(&0)
+                } else {
+                    file_size
+                },
+                is_dir,
+                modified_at,
+                depth,
+            });
+        }
+
+        // Second pass: update directory sizes
+        for entry in &mut entries {
+            if entry.is_dir {
+                entry.size = *dir_sizes.get(&entry.path).unwrap_or(&0);
+            }
+        }
+
+        let stats = ScanStats {
+            total_size,
+            total_files,
+            total_dirs,
+        };
+
+        // Store entries if not streaming
+        if self.sender.is_none() {
+            *self.entries.lock().unwrap() = entries.clone();
+        }
 
         Ok((entries, stats))
     }

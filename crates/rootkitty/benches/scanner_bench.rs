@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rootkitty::scanner::Scanner;
+use rootkitty::scanner::{Scanner, ScannerImpl};
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -134,5 +134,90 @@ fn bench_scanner_depth(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_scanner_directory_walk, bench_scanner_depth);
+/// Comparative benchmark: Custom implementation vs walkdir
+fn bench_scanner_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("comparison");
+
+    // Create a medium-sized test tree for comparison
+    let test_tree = TempDir::new().unwrap();
+    create_benchmark_tree(&test_tree.path().to_path_buf(), 10, 15, 30);
+    let test_path = test_tree.path();
+
+    // Benchmark custom implementation (rayon-based parallel)
+    group.bench_with_input(
+        BenchmarkId::new("custom_impl", "10x15x30"),
+        &test_path,
+        |b, path| {
+            b.iter(|| {
+                let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Custom);
+                scanner.scan().unwrap()
+            })
+        },
+    );
+
+    // Benchmark walkdir implementation (single-threaded)
+    group.bench_with_input(
+        BenchmarkId::new("walkdir_impl", "10x15x30"),
+        &test_path,
+        |b, path| {
+            b.iter(|| {
+                let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Walkdir);
+                scanner.scan().unwrap()
+            })
+        },
+    );
+
+    group.finish();
+}
+
+/// Benchmark different tree sizes with both implementations
+fn bench_scanner_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scaling");
+
+    let configs = [
+        ("small", 5, 10, 20),
+        ("medium", 10, 15, 30),
+        ("large", 15, 20, 40),
+    ];
+
+    for (size_name, breadth_1, breadth_2, files) in configs {
+        let test_tree = TempDir::new().unwrap();
+        create_benchmark_tree(&test_tree.path().to_path_buf(), breadth_1, breadth_2, files);
+        let test_path = test_tree.path();
+
+        // Custom implementation
+        group.bench_with_input(
+            BenchmarkId::new("custom", size_name),
+            &test_path,
+            |b, path| {
+                b.iter(|| {
+                    let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Custom);
+                    scanner.scan().unwrap()
+                })
+            },
+        );
+
+        // Walkdir implementation
+        group.bench_with_input(
+            BenchmarkId::new("walkdir", size_name),
+            &test_path,
+            |b, path| {
+                b.iter(|| {
+                    let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Walkdir);
+                    scanner.scan().unwrap()
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_scanner_directory_walk,
+    bench_scanner_depth,
+    bench_scanner_comparison,
+    bench_scanner_scaling
+);
 criterion_main!(benches);
