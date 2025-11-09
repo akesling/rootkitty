@@ -1,3 +1,9 @@
+mod tree;
+mod types;
+
+pub use tree::SortMode;
+pub use types::View;
+
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -21,65 +27,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum View {
-    ScanList,
-    FileTree,
-    CleanupList,
-    ScanDialog,
-    Scanning,
-    Help,
-    ConfirmDelete,
-    Deleting,
-    PreparingResume,
-    Settings,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortMode {
-    BySize,
-    ByPath,
-}
-
-impl SortMode {
-    fn toggle(&self) -> Self {
-        match self {
-            SortMode::BySize => SortMode::ByPath,
-            SortMode::ByPath => SortMode::BySize,
-        }
-    }
-
-    fn display_name(&self) -> &str {
-        match self {
-            SortMode::BySize => "By Size (Descending)",
-            SortMode::ByPath => "Alphabetical (by path)",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ScanProgress {
-    entries_scanned: u64,
-    active_dirs: Vec<(String, usize, usize)>,
-    active_workers: usize,
-}
-
-struct ActiveScan {
-    scan_id: i64,
-    scan_handle: tokio::task::JoinHandle<
-        Result<(Vec<crate::scanner::FileEntry>, crate::scanner::ScanStats)>,
-    >,
-    actor_handle: tokio::task::JoinHandle<Result<()>>,
-    tx: mpsc::Sender<ActorMessage>,
-    progress_rx: mpsc::UnboundedReceiver<ProgressUpdate>,
-    cancelled: Arc<AtomicBool>,
-}
-
-struct ResumePreparation {
-    scan_id: i64,
-    path: String,
-    load_task: tokio::task::JoinHandle<Result<std::collections::HashSet<String>>>,
-}
+use tree::compute_visible_entries;
+use types::{ActiveScan, ResumePreparation, ScanProgress};
 
 pub struct App {
     db: Database,
@@ -2019,131 +1968,6 @@ fn format_size(bytes: u64) -> String {
         format!("{:.2} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
-    }
-}
-
-/// Pure function to compute visible entries based on folded state
-/// This is separated from App methods to enable unit testing
-fn compute_visible_entries<'a>(
-    all_entries: &'a [StoredFileEntry],
-    folded_dirs: &std::collections::HashSet<String>,
-    sort_mode: SortMode,
-) -> Vec<&'a StoredFileEntry> {
-    let mut visible = Vec::new();
-
-    for entry in all_entries {
-        // Check if any parent directory is folded
-        let mut is_hidden = false;
-
-        // Check each potential parent path
-        let path_parts: Vec<&str> = entry.path.split('/').collect();
-        let mut current_path = String::new();
-
-        for (i, part) in path_parts.iter().enumerate() {
-            if i == path_parts.len() - 1 {
-                // This is the entry itself, not a parent
-                break;
-            }
-
-            if i == 0 {
-                current_path = part.to_string();
-            } else {
-                current_path = format!("{}/{}", current_path, part);
-            }
-
-            if folded_dirs.contains(&current_path) {
-                is_hidden = true;
-                break;
-            }
-        }
-
-        if !is_hidden {
-            visible.push(entry);
-        }
-    }
-
-    // Sort based on the selected mode
-    match sort_mode {
-        SortMode::ByPath => {
-            // Sort by path to ensure hierarchical order (parents before children)
-            visible.sort_by(|a, b| a.path.cmp(&b.path));
-        }
-        SortMode::BySize => {
-            // Tree-based hierarchical sort: sort children by size within each parent,
-            // but keep all descendants with their parent
-            sort_hierarchically_by_size(&mut visible);
-        }
-    }
-
-    visible
-}
-
-/// Sort entries hierarchically by size, maintaining tree structure
-/// This ensures that:
-/// 1. All children of a directory appear immediately after that directory
-/// 2. Within each level, siblings are sorted by size (largest first)
-fn sort_hierarchically_by_size(entries: &mut Vec<&StoredFileEntry>) {
-    // Build a mapping from path to index for quick lookups
-    let path_to_idx: std::collections::HashMap<&str, usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.path.as_str(), i))
-        .collect();
-
-    // Recursively sort entries starting from each root
-    let mut sorted = Vec::new();
-    let mut processed = std::collections::HashSet::new();
-
-    // Find root entries (depth 0 or entries without parents in the list)
-    for (idx, entry) in entries.iter().enumerate() {
-        if entry.depth == 0 || entry.parent_path.is_none() {
-            sort_subtree(idx, entries, &path_to_idx, &mut sorted, &mut processed);
-        }
-    }
-
-    // Copy sorted entries back
-    for (i, entry) in sorted.iter().enumerate() {
-        entries[i] = entry;
-    }
-}
-
-/// Recursively sort a subtree by size
-fn sort_subtree<'a>(
-    idx: usize,
-    all_entries: &[&'a StoredFileEntry],
-    path_to_idx: &std::collections::HashMap<&str, usize>,
-    sorted: &mut Vec<&'a StoredFileEntry>,
-    processed: &mut std::collections::HashSet<usize>,
-) {
-    if processed.contains(&idx) {
-        return;
-    }
-
-    let entry = all_entries[idx];
-    sorted.push(entry);
-    processed.insert(idx);
-
-    // Find all children of this entry
-    let mut children_indices = Vec::new();
-    for (child_idx, child) in all_entries.iter().enumerate() {
-        if processed.contains(&child_idx) {
-            continue;
-        }
-
-        // Check if this child's parent is the current entry
-        if let Some(parent_path) = &child.parent_path {
-            if parent_path == &entry.path {
-                children_indices.push(child_idx);
-            }
-        }
-    }
-
-    // Sort children by size (descending)
-    children_indices.sort_by(|&a, &b| all_entries[b].size.cmp(&all_entries[a].size));
-
-    // Recursively process each child
-    for child_idx in children_indices {
-        sort_subtree(child_idx, all_entries, path_to_idx, sorted, processed);
     }
 }
 
