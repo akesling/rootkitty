@@ -2009,10 +2009,23 @@ impl App {
                     cursor::Show
                 )?;
 
+                // Print informative message to stderr before launching shell
+                eprintln!("\n{}", "=".repeat(60));
+                eprintln!(" Rootkitty: Launching shell in:");
+                eprintln!(" {}", target_dir);
+                eprintln!();
+                eprintln!(" Exit the shell (Ctrl+D or 'exit') to return to rootkitty");
+                eprintln!("{}\n", "=".repeat(60));
+
                 // Launch shell in the target directory
                 let status = std::process::Command::new(&shell)
                     .current_dir(&target_dir)
                     .status();
+
+                // Print return message before re-enabling TUI
+                eprintln!("\n{}", "=".repeat(60));
+                eprintln!(" Returning to rootkitty...");
+                eprintln!("{}\n", "=".repeat(60));
 
                 // Re-enable TUI
                 enable_raw_mode()?;
@@ -2030,7 +2043,7 @@ impl App {
                     Ok(exit_status) => {
                         if exit_status.success() {
                             self.status_message =
-                                format!("Shell exited normally (opened in: {})", target_dir);
+                                format!("✓ Returned from shell (was in: {})", target_dir);
                         } else {
                             self.status_message =
                                 format!("Shell exited with status: {:?}", exit_status.code());
