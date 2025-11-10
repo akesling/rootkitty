@@ -37,9 +37,16 @@ enum Commands {
     Scan {
         /// Path to scan
         path: PathBuf,
+        /// Follow symbolic links during scanning
+        #[arg(short = 'L', long)]
+        follow_symlinks: bool,
     },
     /// Run a demo scan (simulated, no real filesystem access)
-    DemoScan,
+    DemoScan {
+        /// Follow symbolic links during scanning
+        #[arg(short = 'L', long)]
+        follow_symlinks: bool,
+    },
     /// Launch the interactive TUI
     Browse,
     /// List all scans
@@ -82,7 +89,7 @@ async fn main() -> Result<()> {
             let mut app = App::new(db, settings, settings_path, PathBuf::from(&db_path));
             app.run().await?;
         }
-        Some(Commands::DemoScan) => {
+        Some(Commands::DemoScan { follow_symlinks }) => {
             println!("Running demo scan (in-memory database)...");
             // Use in-memory database for demo
             let demo_db = Database::new(":memory:").await?;
@@ -149,6 +156,7 @@ async fn main() -> Result<()> {
                     tx_clone,
                     Some(progress_tx),
                     cancelled_clone,
+                    follow_symlinks,
                 );
                 scanner.scan()
             })
@@ -176,7 +184,10 @@ async fn main() -> Result<()> {
             demo_db.complete_scan(scan_id, &stats).await?;
             println!("Demo scan {} saved to in-memory database", scan_id);
         }
-        Some(Commands::Scan { path }) => {
+        Some(Commands::Scan {
+            path,
+            follow_symlinks,
+        }) => {
             println!("Scanning: {}", path.display());
             let scan_id = db.create_scan(&path).await?;
 
@@ -236,8 +247,13 @@ async fn main() -> Result<()> {
             let cancelled = Arc::new(AtomicBool::new(false));
             let cancelled_clone = cancelled.clone();
             let scan_result = tokio::task::spawn_blocking(move || {
-                let scanner =
-                    Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
+                let scanner = Scanner::with_sender(
+                    &path_clone,
+                    tx_clone,
+                    Some(progress_tx),
+                    cancelled_clone,
+                    follow_symlinks,
+                );
                 scanner.scan()
             })
             .await?;

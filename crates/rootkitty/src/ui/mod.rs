@@ -78,6 +78,8 @@ pub struct App {
     pending_path_change: Option<(usize, PathBuf, PathBuf)>,
     /// Whether pending path exists
     pending_path_exists: bool,
+    /// Whether to follow symlinks during scanning
+    follow_symlinks: bool,
 }
 
 impl App {
@@ -116,6 +118,7 @@ impl App {
             editing_path_index: None,
             pending_path_change: None,
             pending_path_exists: false,
+            follow_symlinks: settings.scan.follow_symlinks,
         }
     }
 
@@ -544,6 +547,7 @@ impl App {
                                                 scan_list_sort: self.scan_list_sort,
                                                 auto_fold_depth: 1,
                                             },
+                                            scan: crate::settings::ScanSettings::default(),
                                         };
 
                                         match current_settings.save(&new_path) {
@@ -739,6 +743,7 @@ impl App {
                                                         scan_list_sort: self.scan_list_sort,
                                                         auto_fold_depth: 1,
                                                     },
+                                                    scan: crate::settings::ScanSettings::default(),
                                                 };
 
                                                 match current_settings.save(&default_path) {
@@ -789,6 +794,23 @@ impl App {
                                                     self.status_message = format!(
                                                         "Scan list sort: {}",
                                                         self.scan_list_sort.display_name()
+                                                    );
+                                                    // Save settings to disk
+                                                    if let Err(e) = self.save_settings() {
+                                                        self.status_message =
+                                                            format!("Error saving settings: {}", e);
+                                                    }
+                                                }
+                                                6 => {
+                                                    // Follow Symlinks (index 6)
+                                                    self.follow_symlinks = !self.follow_symlinks;
+                                                    self.status_message = format!(
+                                                        "Follow symlinks: {}",
+                                                        if self.follow_symlinks {
+                                                            "Yes"
+                                                        } else {
+                                                            "No"
+                                                        }
                                                     );
                                                     // Save settings to disk
                                                     if let Err(e) = self.save_settings() {
@@ -1471,6 +1493,10 @@ impl App {
                 self.scan_list_sort.display_name().to_string(),
             ),
             ("Auto-fold Depth", "1 level".to_string()),
+            (
+                "Follow Symlinks",
+                if self.follow_symlinks { "Yes" } else { "No" }.to_string(),
+            ),
             ("", "".to_string()), // Spacer
             ("About", "Rootkitty - Disk Usage Analyzer".to_string()),
             ("Version", env!("CARGO_PKG_VERSION").to_string()),
@@ -1485,14 +1511,14 @@ impl App {
                 } else {
                     // Index 0: config path (editable)
                     // Index 1: database path (editable)
-                    // Indices 3 and 4: sort settings (toggleable)
+                    // Indices 3, 4, and 6: sort settings and follow symlinks (toggleable)
                     let indicator = if idx == 0 || idx == 1 {
                         if self.editing_path_index == Some(idx) {
                             "[editing...]"
                         } else {
                             "[e/r]"
                         }
-                    } else if idx == 3 || idx == 4 {
+                    } else if idx == 3 || idx == 4 || idx == 6 {
                         "[t]"
                     } else {
                         "   "
@@ -1683,6 +1709,9 @@ impl App {
                 file_tree_sort: self.file_tree_sort,
                 scan_list_sort: self.scan_list_sort,
                 auto_fold_depth: 1, // Current default, will be configurable later
+            },
+            scan: crate::settings::ScanSettings {
+                follow_symlinks: self.follow_symlinks,
             },
         };
         settings.save(&self.settings_path)?;
@@ -1896,9 +1925,15 @@ impl App {
         let cancelled_clone = cancelled.clone();
 
         // Spawn scanner in blocking thread (with resume support)
+        let follow_symlinks = self.follow_symlinks;
         let scan_handle = tokio::task::spawn_blocking(move || {
-            let scanner =
-                Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
+            let scanner = Scanner::with_sender(
+                &path_clone,
+                tx_clone,
+                Some(progress_tx),
+                cancelled_clone,
+                follow_symlinks,
+            );
             scanner.scan_resuming(scanned_paths)
         });
 
@@ -1944,11 +1979,17 @@ impl App {
         let tx_clone = tx.clone();
         let path_clone = path_buf.clone();
         let cancelled_clone = cancelled.clone();
+        let follow_symlinks = self.follow_symlinks;
 
         // Spawn scanner in blocking thread
         let scan_handle = tokio::task::spawn_blocking(move || {
-            let scanner =
-                Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled_clone);
+            let scanner = Scanner::with_sender(
+                &path_clone,
+                tx_clone,
+                Some(progress_tx),
+                cancelled_clone,
+                follow_symlinks,
+            );
             scanner.scan()
         });
 
@@ -2330,10 +2371,10 @@ impl App {
     }
 
     fn settings_list_next(&mut self) {
-        // Settings has 9 items (0-8)
-        // Empty lines are at indices 2 and 6 (should be skipped)
-        let num_items = 9;
-        let empty_indices = [2, 6];
+        // Settings has 10 items (0-9)
+        // Empty lines are at indices 2 and 7 (should be skipped)
+        let num_items = 10;
+        let empty_indices = [2, 7];
 
         let mut i = match self.settings_list_state.selected() {
             Some(i) => {
@@ -2355,10 +2396,10 @@ impl App {
     }
 
     fn settings_list_previous(&mut self) {
-        // Settings has 9 items (0-8)
-        // Empty lines are at indices 2 and 6 (should be skipped)
-        let num_items = 9;
-        let empty_indices = [2, 6];
+        // Settings has 10 items (0-9)
+        // Empty lines are at indices 2 and 7 (should be skipped)
+        let num_items = 10;
+        let empty_indices = [2, 7];
 
         let mut i = match self.settings_list_state.selected() {
             Some(i) => {

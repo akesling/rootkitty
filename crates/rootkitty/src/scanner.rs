@@ -71,6 +71,8 @@ pub struct Scanner {
     cancelled: Arc<AtomicBool>,
     /// Implementation to use for scanning
     implementation: ScannerImpl,
+    /// Whether to follow symbolic links during scanning
+    follow_symlinks: bool,
 }
 
 impl Scanner {
@@ -79,6 +81,7 @@ impl Scanner {
         sender: mpsc::Sender<crate::db::ActorMessage>,
         progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
         cancelled: Arc<AtomicBool>,
+        follow_symlinks: bool,
     ) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
@@ -91,6 +94,7 @@ impl Scanner {
             demo_mode: false,
             cancelled,
             implementation: ScannerImpl::Custom,
+            follow_symlinks,
         }
     }
 
@@ -99,6 +103,7 @@ impl Scanner {
         sender: mpsc::Sender<crate::db::ActorMessage>,
         progress_sender: Option<mpsc::UnboundedSender<ProgressUpdate>>,
         cancelled: Arc<AtomicBool>,
+        follow_symlinks: bool,
     ) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
@@ -111,6 +116,7 @@ impl Scanner {
             demo_mode: true,
             cancelled,
             implementation: ScannerImpl::Custom,
+            follow_symlinks,
         }
     }
 
@@ -133,6 +139,7 @@ impl Scanner {
             demo_mode: false,
             cancelled: Arc::new(AtomicBool::new(false)),
             implementation,
+            follow_symlinks: false, // Default to false for benchmarks
         }
     }
 
@@ -190,7 +197,7 @@ impl Scanner {
 
         // First pass: collect all entries and calculate file sizes
         let walker = WalkDir::new(&self.root_path)
-            .follow_links(false)
+            .follow_links(self.follow_symlinks)
             .into_iter()
             .filter_map(|e| e.ok());
 
@@ -274,7 +281,7 @@ impl Scanner {
 
         // Use jwalk to traverse in PARALLEL (faster than single-threaded walkdir)!
         let walker = WalkDir::new(&self.root_path)
-            .follow_links(false)
+            .follow_links(self.follow_symlinks)
             .into_iter()
             .filter_map(|e| e.ok());
 
@@ -960,7 +967,7 @@ mod tests {
         let root = temp_dir.path();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let scanner = Scanner::with_sender(root, tx, None, Arc::new(AtomicBool::new(false)));
+        let scanner = Scanner::with_sender(root, tx, None, Arc::new(AtomicBool::new(false)), false);
 
         // Spawn a task to collect entries from the channel
         let collect_handle = std::thread::spawn(move || {
@@ -1039,6 +1046,7 @@ mod tests {
             tx,
             Some(progress_tx),
             Arc::new(AtomicBool::new(false)),
+            false,
         );
 
         // Spawn task to collect progress updates

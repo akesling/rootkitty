@@ -10,6 +10,8 @@ pub use crate::ui::SortMode;
 pub struct Settings {
     #[serde(default)]
     pub ui: UiSettings,
+    #[serde(default)]
+    pub scan: ScanSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,12 +24,27 @@ pub struct UiSettings {
     pub auto_fold_depth: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanSettings {
+    /// Whether to follow symbolic links during scanning
+    #[serde(default = "default_follow_symlinks")]
+    pub follow_symlinks: bool,
+}
+
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
             file_tree_sort: default_file_tree_sort(),
             scan_list_sort: default_scan_list_sort(),
             auto_fold_depth: default_auto_fold_depth(),
+        }
+    }
+}
+
+impl Default for ScanSettings {
+    fn default() -> Self {
+        Self {
+            follow_symlinks: default_follow_symlinks(),
         }
     }
 }
@@ -42,6 +59,10 @@ fn default_scan_list_sort() -> SortMode {
 
 fn default_auto_fold_depth() -> u32 {
     1
+}
+
+fn default_follow_symlinks() -> bool {
+    false
 }
 
 impl Settings {
@@ -131,6 +152,7 @@ mod tests {
         assert_eq!(settings.ui.file_tree_sort, SortMode::ByPath);
         assert_eq!(settings.ui.scan_list_sort, SortMode::BySize);
         assert_eq!(settings.ui.auto_fold_depth, 1);
+        assert!(!settings.scan.follow_symlinks);
     }
 
     #[test]
