@@ -1175,10 +1175,20 @@ impl App {
             })
             .collect();
 
+        // Calculate database size for display
+        let db_size = self.get_database_size();
+        let db_size_str = format_size(db_size);
+
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(
-                "Scans (1) | Enter: view | r: resume paused | n: new | ↑/↓ or j/k: navigate",
-            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Scans (1) | Enter: view | r: resume paused | n: new | ↑/↓ or j/k: navigate")
+                    .title_top(
+                        Line::from(format!(" DB: {} ", db_size_str))
+                            .right_aligned()
+                    )
+            )
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -2064,6 +2074,32 @@ impl App {
 
     fn get_visible_entries(&self) -> Vec<&StoredFileEntry> {
         compute_visible_entries(&self.file_entries, &self.folded_dirs, self.file_tree_sort)
+    }
+
+    /// Get the total size of the database on disk (including WAL files)
+    fn get_database_size(&self) -> u64 {
+        let mut total_size = 0u64;
+
+        // Main database file
+        if let Ok(metadata) = std::fs::metadata(&self.db_path) {
+            total_size += metadata.len();
+        }
+
+        // WAL file (Write-Ahead Log)
+        let mut wal_path = self.db_path.clone();
+        wal_path.set_extension("db-wal");
+        if let Ok(metadata) = std::fs::metadata(&wal_path) {
+            total_size += metadata.len();
+        }
+
+        // SHM file (Shared Memory)
+        let mut shm_path = self.db_path.clone();
+        shm_path.set_extension("db-shm");
+        if let Ok(metadata) = std::fs::metadata(&shm_path) {
+            total_size += metadata.len();
+        }
+
+        total_size
     }
 
     async fn toggle_cleanup_mark(&mut self) -> Result<()> {
