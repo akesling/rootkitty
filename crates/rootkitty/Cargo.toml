@@ -24,6 +24,7 @@ toml = { workspace = true }
 rayon = { workspace = true }
 walkdir = { workspace = true }
 crossbeam = { workspace = true }
+jwalk = { workspace = true }
 shellexpand = "3.1"
 
 [dev-dependencies]

@@ -268,16 +268,16 @@ impl Scanner {
     }
 
     fn scan_hybrid(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
+        use jwalk::WalkDir;
         use rayon::prelude::*;
-        use walkdir::WalkDir;
 
-        // Use walkdir to traverse (reliable), but process in parallel with rayon!
+        // Use jwalk to traverse in PARALLEL (faster than single-threaded walkdir)!
         let walker = WalkDir::new(&self.root_path)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok());
 
-        // Collect all entries first (walkdir guarantees correct traversal order)
+        // Collect all entries (jwalk does parallel traversal internally)
         let all_entries: Vec<_> = walker.collect();
 
         // Build directory sizes map in parallel
@@ -286,8 +286,9 @@ impl Scanner {
             .filter(|e| !e.file_type().is_dir())
             .flat_map(|entry| {
                 let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                let path = entry.path(); // Store path to extend lifetime
                 let mut contributions = Vec::new();
-                let mut current = entry.path().parent();
+                let mut current = path.parent();
                 while let Some(parent) = current {
                     contributions.push((parent.to_path_buf(), size));
                     current = parent.parent();
