@@ -5,9 +5,13 @@ pub use types::{SortMode, View};
 
 use anyhow::Result;
 use crossterm::{
+    cursor,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -365,6 +369,13 @@ impl App {
                                 // Unfold all nested folders recursively
                                 if let Err(e) = self.toggle_fold_directory(true) {
                                     self.status_message = format!("Error unfolding: {}", e);
+                                }
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('s') => {
+                                // Open shell in selected directory or parent
+                                if let Err(e) = self.open_shell(terminal) {
+                                    self.status_message = format!("Error opening shell: {}", e);
                                 }
                                 self.g_pressed = false;
                             }
@@ -1181,7 +1192,7 @@ impl App {
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
         let title = if let Some(scan) = &self.current_scan {
             format!(
-                "Files (2) | Scan: {} | z: fold/unfold | Z: unfold all | Space: mark",
+                "Files (2) | Scan: {} | z: fold/unfold | Z: unfold all | s: shell | Space: mark",
                 scan.root_path
             )
         } else {
@@ -1360,6 +1371,7 @@ impl App {
             Line::from("  Space       Remove from cleanup list (Cleanup view)"),
             Line::from("  z/o         Fold/unfold directory (File view)"),
             Line::from("  Z/O         Unfold directory and all subdirs (File view)"),
+            Line::from("  s           Open shell in directory/parent (File view)"),
             Line::from("  s/g         Generate cleanup script (Cleanup view)"),
             Line::from("  Enter/o     Select/open"),
             Line::from(""),
@@ -1755,7 +1767,7 @@ impl App {
                 "q: quit | n: new | t: toggle sort | S: settings | 1: scans | 2: files | 3: cleanup"
             }
             View::FileTree => {
-                "q: quit | t: toggle sort | S: settings | Space: mark | z: fold | ↑↓/jk: navigate"
+                "q: quit | t: toggle sort | s: shell | Space: mark | z: fold | ↑↓/jk: navigate"
             }
             View::CleanupList => {
                 "q: quit | S: settings | 1: scans | 2: files | 3: cleanup | s: generate | Space: remove"
@@ -1949,6 +1961,92 @@ impl App {
         self.folded_dirs.insert(dir_path.to_string());
 
         // We don't need to fold children since they'll be hidden anyway
+    }
+
+    fn open_shell(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        if let Some(selected) = self.file_list_state.selected() {
+            let visible_entries = self.get_visible_entries();
+            if let Some(entry) = visible_entries.get(selected) {
+                // Determine the directory to open:
+                // - If it's a directory, use it directly
+                // - If it's a file, use its parent directory
+                let target_dir = if entry.is_dir {
+                    entry.path.clone()
+                } else {
+                    // Use parent_path if available, otherwise extract from path
+                    entry.parent_path.clone().unwrap_or_else(|| {
+                        // Extract parent from path (everything before last /)
+                        entry
+                            .path
+                            .rsplit_once('/')
+                            .map(|(parent, _)| parent.to_string())
+                            .unwrap_or_else(|| entry.path.clone())
+                    })
+                };
+
+                // Determine the shell to use (check SHELL env var, fallback to common shells)
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+                    // Fallback chain: bash -> zsh -> sh
+                    if std::path::Path::new("/bin/bash").exists() {
+                        "/bin/bash".to_string()
+                    } else if std::path::Path::new("/bin/zsh").exists() {
+                        "/bin/zsh".to_string()
+                    } else {
+                        "/bin/sh".to_string()
+                    }
+                });
+
+                // We need to exit the TUI temporarily to run the shell
+                // Restore terminal first
+                disable_raw_mode()?;
+                execute!(
+                    io::stdout(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture,
+                    cursor::Show
+                )?;
+
+                // Launch shell in the target directory
+                let status = std::process::Command::new(&shell)
+                    .current_dir(&target_dir)
+                    .status();
+
+                // Re-enable TUI
+                enable_raw_mode()?;
+                execute!(
+                    io::stdout(),
+                    EnterAlternateScreen,
+                    EnableMouseCapture,
+                    Clear(ClearType::All)
+                )?;
+
+                // Force a full redraw of the terminal
+                terminal.clear()?;
+
+                match status {
+                    Ok(exit_status) => {
+                        if exit_status.success() {
+                            self.status_message =
+                                format!("Shell exited normally (opened in: {})", target_dir);
+                        } else {
+                            self.status_message =
+                                format!("Shell exited with status: {:?}", exit_status.code());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to launch shell: {}", e));
+                    }
+                }
+            } else {
+                self.status_message = "No entry selected".to_string();
+            }
+        } else {
+            self.status_message = "No entry selected".to_string();
+        }
+        Ok(())
     }
 
     fn get_visible_entries(&self) -> Vec<&StoredFileEntry> {
