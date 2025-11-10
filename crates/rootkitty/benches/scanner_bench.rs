@@ -134,7 +134,7 @@ fn bench_scanner_depth(c: &mut Criterion) {
     group.finish();
 }
 
-/// Comparative benchmark: Custom implementation vs walkdir
+/// Comparative benchmark: Custom implementation vs walkdir vs hybrid
 fn bench_scanner_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("comparison");
 
@@ -167,10 +167,22 @@ fn bench_scanner_comparison(c: &mut Criterion) {
         },
     );
 
+    // Benchmark hybrid implementation (walkdir + rayon)
+    group.bench_with_input(
+        BenchmarkId::new("hybrid_impl", "10x15x30"),
+        &test_path,
+        |b, path| {
+            b.iter(|| {
+                let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Hybrid);
+                scanner.scan().unwrap()
+            })
+        },
+    );
+
     group.finish();
 }
 
-/// Benchmark different tree sizes with both implementations
+/// Benchmark different tree sizes with all three implementations
 fn bench_scanner_scaling(c: &mut Criterion) {
     let mut group = c.benchmark_group("scaling");
 
@@ -204,6 +216,18 @@ fn bench_scanner_scaling(c: &mut Criterion) {
             |b, path| {
                 b.iter(|| {
                     let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Walkdir);
+                    scanner.scan().unwrap()
+                })
+            },
+        );
+
+        // Hybrid implementation
+        group.bench_with_input(
+            BenchmarkId::new("hybrid", size_name),
+            &test_path,
+            |b, path| {
+                b.iter(|| {
+                    let scanner = Scanner::new_with_impl(black_box(path), ScannerImpl::Hybrid);
                     scanner.scan().unwrap()
                 })
             },

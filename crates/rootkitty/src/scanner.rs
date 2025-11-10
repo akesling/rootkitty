@@ -51,6 +51,8 @@ pub enum ScannerImpl {
     Custom,
     /// walkdir-based single-threaded implementation
     Walkdir,
+    /// Hybrid: walkdir for traversal + rayon for parallelism
+    Hybrid,
 }
 
 pub struct Scanner {
@@ -144,6 +146,7 @@ impl Scanner {
         match self.implementation {
             ScannerImpl::Custom => self.scan_custom(),
             ScannerImpl::Walkdir => self.scan_walkdir(),
+            ScannerImpl::Hybrid => self.scan_hybrid(),
         }
     }
 
@@ -254,6 +257,132 @@ impl Scanner {
             total_size,
             total_files,
             total_dirs,
+        };
+
+        // Store entries if not streaming
+        if self.sender.is_none() {
+            *self.entries.lock().unwrap() = entries.clone();
+        }
+
+        Ok((entries, stats))
+    }
+
+    fn scan_hybrid(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
+        use rayon::prelude::*;
+        use walkdir::WalkDir;
+
+        // Use walkdir to traverse (reliable), but process in parallel with rayon!
+        let walker = WalkDir::new(&self.root_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok());
+
+        // Collect all entries first (walkdir guarantees correct traversal order)
+        let all_entries: Vec<_> = walker.collect();
+
+        // Build directory sizes map in parallel
+        let dir_sizes: HashMap<PathBuf, u64> = all_entries
+            .par_iter()
+            .filter(|e| !e.file_type().is_dir())
+            .flat_map(|entry| {
+                let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                let mut contributions = Vec::new();
+                let mut current = entry.path().parent();
+                while let Some(parent) = current {
+                    contributions.push((parent.to_path_buf(), size));
+                    current = parent.parent();
+                }
+                contributions
+            })
+            .fold(
+                HashMap::new,
+                |mut map: HashMap<PathBuf, u64>, (path, size)| {
+                    *map.entry(path).or_insert(0) += size;
+                    map
+                },
+            )
+            .reduce(HashMap::new, |mut a, b| {
+                for (path, size) in b {
+                    *a.entry(path).or_insert(0) += size;
+                }
+                a
+            });
+
+        // Build FileEntry objects in parallel
+        let entries: Vec<FileEntry> = all_entries
+            .par_iter()
+            .map(|entry| {
+                let path = entry.path().to_path_buf();
+                let metadata = entry.metadata().ok();
+                let is_dir = entry.file_type().is_dir();
+
+                let name = if path == self.root_path {
+                    self.root_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("/")
+                        .to_string()
+                } else {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+
+                let parent_path = path.parent().map(|p| p.to_path_buf());
+                let modified_at = metadata.as_ref().and_then(|m| {
+                    m.modified().ok().map(|t| {
+                        let system_time: std::time::SystemTime = t;
+                        DateTime::<Utc>::from(system_time)
+                    })
+                });
+
+                let file_size = if is_dir {
+                    0
+                } else {
+                    metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+                };
+
+                let size = if is_dir {
+                    *dir_sizes.get(&path).unwrap_or(&0)
+                } else {
+                    file_size
+                };
+
+                FileEntry {
+                    path,
+                    name,
+                    parent_path,
+                    size,
+                    is_dir,
+                    modified_at,
+                    depth: entry.depth(),
+                }
+            })
+            .collect();
+
+        // Calculate stats in parallel
+        let (total_files, total_dirs): (usize, usize) = all_entries
+            .par_iter()
+            .map(|e| {
+                if e.file_type().is_dir() {
+                    (0, 1)
+                } else {
+                    (1, 0)
+                }
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+
+        let total_size: u64 = all_entries
+            .par_iter()
+            .filter(|e| !e.file_type().is_dir())
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum();
+
+        let stats = ScanStats {
+            total_size,
+            total_files: total_files as u64,
+            total_dirs: total_dirs as u64,
         };
 
         // Store entries if not streaming
@@ -762,9 +891,7 @@ impl Scanner {
     }
 }
 
-// TODO: Fix scanner tests - Scanner::new no longer exists, API changed
-#[cfg(all(test, feature = "scanner_tests_disabled"))]
-#[allow(dead_code)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -791,12 +918,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Fix - Scanner::new no longer exists
-    fn test_basic_scan() {
+    fn test_hybrid_scan() {
         let temp_dir = create_test_filesystem();
         let root = temp_dir.path();
 
-        let scanner = Scanner::new(root);
+        let scanner = Scanner::new_with_impl(root, ScannerImpl::Hybrid);
         let (entries, stats) = scanner.scan().unwrap();
 
         // Should have at least 5 files (file1, file2, file3, file4, deep.txt)
@@ -832,7 +958,7 @@ mod tests {
         let root = temp_dir.path();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-        let scanner = Scanner::with_sender(root, tx, None);
+        let scanner = Scanner::with_sender(root, tx, None, Arc::new(AtomicBool::new(false)));
 
         // Spawn a task to collect entries from the channel
         let collect_handle = std::thread::spawn(move || {
@@ -906,7 +1032,12 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(100);
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let scanner = Scanner::with_sender(root, tx, Some(progress_tx));
+        let scanner = Scanner::with_sender(
+            root,
+            tx,
+            Some(progress_tx),
+            Arc::new(AtomicBool::new(false)),
+        );
 
         // Spawn task to collect progress updates
         let progress_handle = std::thread::spawn(move || {
