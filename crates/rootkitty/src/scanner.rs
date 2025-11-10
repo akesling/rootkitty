@@ -93,7 +93,7 @@ impl Scanner {
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: false,
             cancelled,
-            implementation: ScannerImpl::Custom,
+            implementation: ScannerImpl::Hybrid,
             follow_symlinks,
         }
     }
@@ -115,13 +115,13 @@ impl Scanner {
             active_workers: Arc::new(AtomicUsize::new(0)),
             demo_mode: true,
             cancelled,
-            implementation: ScannerImpl::Custom,
+            implementation: ScannerImpl::Hybrid,
             follow_symlinks,
         }
     }
 
     /// Simple constructor for benchmarking - collects entries in memory
-    /// Uses the custom rayon-based parallel implementation by default
+    /// Uses the hybrid jwalk+rayon implementation by default
     pub fn new<P: AsRef<Path>>(root_path: P) -> Self {
         Self::new_with_impl(root_path, ScannerImpl::Custom)
     }
@@ -212,6 +212,11 @@ impl Scanner {
                 Err(_) => continue,
             };
 
+            // Skip symlinks if follow_symlinks is false
+            if !self.follow_symlinks && metadata.is_symlink() {
+                continue;
+            }
+
             let is_dir = metadata.is_dir();
             let file_size = if is_dir { 0 } else { metadata.len() };
 
@@ -286,7 +291,12 @@ impl Scanner {
             .filter_map(|e| e.ok());
 
         // Collect all entries (jwalk does parallel traversal internally)
-        let all_entries: Vec<_> = walker.collect();
+        let mut all_entries: Vec<_> = walker.collect();
+
+        // Filter out symlinks if follow_symlinks is false
+        if !self.follow_symlinks {
+            all_entries.retain(|entry| !entry.file_type().is_symlink());
+        }
 
         // Single-pass parallel processing: compute dir_sizes AND stats at the same time!
         let total_files = AtomicUsize::new(0);
@@ -394,12 +404,22 @@ impl Scanner {
             total_dirs: total_dirs.load(Ordering::Relaxed) as u64,
         };
 
-        // Store entries if not streaming
-        if self.sender.is_none() {
-            *self.entries.lock().unwrap() = entries.clone();
+        // Add all entries via add_entry to handle streaming
+        for entry in &entries {
+            self.add_entry(entry.clone());
         }
 
-        Ok((entries, stats))
+        // Flush any remaining buffered entries
+        self.flush_buffer()?;
+
+        let final_entries = if self.sender.is_some() {
+            // If streaming, we already sent everything, return empty vec
+            Vec::new()
+        } else {
+            entries
+        };
+
+        Ok((final_entries, stats))
     }
 
     /// Resume a scan that was previously paused, skipping already-scanned paths
@@ -471,10 +491,22 @@ impl Scanner {
             return Ok(0);
         }
 
-        let metadata = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return Ok(0), // Skip inaccessible files
+        let metadata = if self.follow_symlinks {
+            match fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return Ok(0), // Skip inaccessible files
+            }
+        } else {
+            match fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(_) => return Ok(0), // Skip inaccessible files
+            }
         };
+
+        // Skip symlinks if follow_symlinks is false
+        if !self.follow_symlinks && metadata.is_symlink() {
+            return Ok(0);
+        }
 
         let modified_at = metadata.modified().ok().and_then(|t| {
             DateTime::from_timestamp(
@@ -628,10 +660,22 @@ impl Scanner {
             return Ok(0);
         }
 
-        let metadata = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return Ok(0), // Skip inaccessible files
+        let metadata = if self.follow_symlinks {
+            match fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => return Ok(0), // Skip inaccessible files
+            }
+        } else {
+            match fs::symlink_metadata(path) {
+                Ok(m) => m,
+                Err(_) => return Ok(0), // Skip inaccessible files
+            }
         };
+
+        // Skip symlinks if follow_symlinks is false
+        if !self.follow_symlinks && metadata.is_symlink() {
+            return Ok(0);
+        }
 
         let modified_at = metadata.modified().ok().and_then(|t| {
             DateTime::from_timestamp(
@@ -1093,5 +1137,145 @@ mod tests {
 
         // Directory size should be sum of its contents
         assert_eq!(dir1_entry.size, 10, "dir1 should have size 10 (5+5)");
+    }
+
+    #[test]
+    fn test_symlink_handling_all_implementations() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a regular directory with files
+        fs::create_dir(root.join("real_dir")).unwrap();
+        fs::write(root.join("real_dir/file1.txt"), b"content1").unwrap();
+        fs::write(root.join("real_dir/file2.txt"), b"content2").unwrap();
+
+        // Create a symlink to the directory
+        symlink(root.join("real_dir"), root.join("symlink_dir")).unwrap();
+
+        // Create a symlink to a file
+        symlink(
+            root.join("real_dir/file1.txt"),
+            root.join("symlink_file.txt"),
+        )
+        .unwrap();
+
+        // Test all three implementations with follow_symlinks = false
+        for (impl_name, scanner_impl) in [
+            ("Custom", ScannerImpl::Custom),
+            ("Walkdir", ScannerImpl::Walkdir),
+            ("Hybrid", ScannerImpl::Hybrid),
+        ] {
+            println!(
+                "Testing {} implementation with follow_symlinks=false",
+                impl_name
+            );
+
+            let scanner = Scanner::new_with_impl(root, scanner_impl);
+            assert!(
+                !scanner.follow_symlinks,
+                "{}: follow_symlinks should be false",
+                impl_name
+            );
+
+            let (entries, stats) = scanner.scan().unwrap();
+
+            // Should NOT follow symlinks, so:
+            // - real_dir/ (1 dir)
+            // - real_dir/file1.txt, real_dir/file2.txt (2 files)
+            // - symlink_dir/ (counted as 1 symlink, not traversed)
+            // - symlink_file.txt (counted as 1 symlink)
+            // - root directory itself
+
+            // Count files (not counting symlinks)
+            let regular_files: Vec<_> = entries
+                .iter()
+                .filter(|e| !e.is_dir && e.name != "symlink_file.txt" && e.name != "symlink_dir")
+                .collect();
+
+            assert_eq!(
+                regular_files.len(),
+                2,
+                "{}: Should find exactly 2 regular files (file1.txt, file2.txt), found: {:?}",
+                impl_name,
+                regular_files.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+
+            // Count directories (not counting symlink to directory)
+            let regular_dirs: Vec<_> = entries
+                .iter()
+                .filter(|e| e.is_dir && e.name != "symlink_dir")
+                .collect();
+
+            // Should be at least 2: root + real_dir
+            assert!(
+                regular_dirs.len() >= 2,
+                "{}: Should find at least 2 directories (root, real_dir), found {} dirs: {:?}",
+                impl_name,
+                regular_dirs.len(),
+                regular_dirs.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+
+            // Stats should reflect only real files, not following symlinks
+            assert_eq!(
+                stats.total_files, 2,
+                "{}: total_files should be 2, got {}",
+                impl_name, stats.total_files
+            );
+        }
+
+        // Now test with follow_symlinks = true (only works on Unix)
+        #[cfg(unix)]
+        {
+            // We need a way to create a scanner with follow_symlinks=true
+            // For now, we'll use the with_sender constructor
+            let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+            for (impl_name, _scanner_impl) in [
+                ("Custom", ScannerImpl::Custom),
+                ("Walkdir", ScannerImpl::Walkdir),
+                ("Hybrid", ScannerImpl::Hybrid),
+            ] {
+                println!(
+                    "Testing {} implementation with follow_symlinks=true",
+                    impl_name
+                );
+
+                // Create scanner with follow_symlinks=true
+                let scanner = Scanner::with_sender(
+                    root,
+                    tx.clone(),
+                    None,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    true, // follow_symlinks = true
+                );
+                assert!(
+                    scanner.follow_symlinks,
+                    "{}: follow_symlinks should be true",
+                    impl_name
+                );
+
+                let (_entries, stats) = scanner.scan().unwrap();
+
+                // When following symlinks:
+                // - Should traverse into symlink_dir and find files there
+                // - symlink_file.txt should resolve to its target
+                // - Will see duplicate files through different paths
+
+                // Should find MORE than 2 files because symlinks are followed
+                assert!(
+                    stats.total_files >= 2,
+                    "{}: When following symlinks, should find at least 2 files, got {}",
+                    impl_name,
+                    stats.total_files
+                );
+
+                println!(
+                    "{}: Found {} files (following symlinks)",
+                    impl_name, stats.total_files
+                );
+            }
+        }
     }
 }

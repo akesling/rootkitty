@@ -9,3 +9,4 @@
   potentially better batching?)
 * Allow resumption of paused/cancelled scan for _only_ a given subtree of the
   scan so far
+* Make sure we actually display "hidden" files
