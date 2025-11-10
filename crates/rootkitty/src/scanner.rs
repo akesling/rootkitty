@@ -270,6 +270,7 @@ impl Scanner {
     fn scan_hybrid(&self) -> Result<(Vec<FileEntry>, ScanStats)> {
         use jwalk::WalkDir;
         use rayon::prelude::*;
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
 
         // Use jwalk to traverse in PARALLEL (faster than single-threaded walkdir)!
         let walker = WalkDir::new(&self.root_path)
@@ -280,36 +281,54 @@ impl Scanner {
         // Collect all entries (jwalk does parallel traversal internally)
         let all_entries: Vec<_> = walker.collect();
 
-        // Build directory sizes map in parallel
+        // Single-pass parallel processing: compute dir_sizes AND stats at the same time!
+        let total_files = AtomicUsize::new(0);
+        let total_dirs = AtomicUsize::new(0);
+        let total_size = AtomicU64::new(0);
+
         let dir_sizes: HashMap<PathBuf, u64> = all_entries
             .par_iter()
-            .filter(|e| !e.file_type().is_dir())
-            .flat_map(|entry| {
-                let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                let path = entry.path(); // Store path to extend lifetime
-                let mut contributions = Vec::new();
-                let mut current = path.parent();
-                while let Some(parent) = current {
-                    contributions.push((parent.to_path_buf(), size));
-                    current = parent.parent();
-                }
-                contributions
-            })
             .fold(
-                HashMap::new,
-                |mut map: HashMap<PathBuf, u64>, (path, size)| {
-                    *map.entry(path).or_insert(0) += size;
-                    map
+                || (HashMap::new(), 0, 0, 0u64), // (map, files, dirs, size)
+                |(mut map, mut files, mut dirs, mut size), entry| {
+                    let is_dir = entry.file_type().is_dir();
+
+                    // Update stats inline
+                    if is_dir {
+                        dirs += 1;
+                    } else {
+                        files += 1;
+                        let file_size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                        size += file_size;
+
+                        // Calculate dir contributions for this file
+                        let path = entry.path();
+                        let mut current = path.parent();
+                        while let Some(parent) = current {
+                            *map.entry(parent.to_path_buf()).or_insert(0) += file_size;
+                            current = parent.parent();
+                        }
+                    }
+                    (map, files, dirs, size)
                 },
             )
-            .reduce(HashMap::new, |mut a, b| {
-                for (path, size) in b {
-                    *a.entry(path).or_insert(0) += size;
-                }
-                a
-            });
+            .reduce(
+                || (HashMap::new(), 0, 0, 0u64),
+                |(mut map_a, files_a, dirs_a, size_a), (map_b, files_b, dirs_b, size_b)| {
+                    // Merge maps
+                    for (path, size) in map_b {
+                        *map_a.entry(path).or_insert(0) += size;
+                    }
+                    // Merge stats
+                    total_files.fetch_add(files_a + files_b, Ordering::Relaxed);
+                    total_dirs.fetch_add(dirs_a + dirs_b, Ordering::Relaxed);
+                    total_size.fetch_add(size_a + size_b, Ordering::Relaxed);
+                    (map_a, 0, 0, 0)
+                },
+            )
+            .0;
 
-        // Build FileEntry objects in parallel
+        // Single-pass parallel FileEntry construction (now just one parallel op!)
         let entries: Vec<FileEntry> = all_entries
             .par_iter()
             .map(|entry| {
@@ -362,28 +381,10 @@ impl Scanner {
             })
             .collect();
 
-        // Calculate stats in parallel
-        let (total_files, total_dirs): (usize, usize) = all_entries
-            .par_iter()
-            .map(|e| {
-                if e.file_type().is_dir() {
-                    (0, 1)
-                } else {
-                    (1, 0)
-                }
-            })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-
-        let total_size: u64 = all_entries
-            .par_iter()
-            .filter(|e| !e.file_type().is_dir())
-            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
-            .sum();
-
         let stats = ScanStats {
-            total_size,
-            total_files: total_files as u64,
-            total_dirs: total_dirs as u64,
+            total_size: total_size.load(Ordering::Relaxed),
+            total_files: total_files.load(Ordering::Relaxed) as u64,
+            total_dirs: total_dirs.load(Ordering::Relaxed) as u64,
         };
 
         // Store entries if not streaming
