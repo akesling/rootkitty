@@ -30,6 +30,16 @@ use tokio::sync::mpsc;
 use tree::compute_visible_entries;
 use types::{ActiveScan, ResumePreparation, ScanProgress};
 
+/// Result types for async loading operations
+enum LoadingResult {
+    /// Loaded entries for a scan (scan_id, entries)
+    ScanEntries(i64, Vec<StoredFileEntry>),
+    /// Loaded children for a directory (parent_path, children)
+    DirectoryChildren(String, Vec<StoredFileEntry>),
+    /// Loaded all descendants recursively (parent_path, all_descendants)
+    RecursiveChildren(String, Vec<StoredFileEntry>),
+}
+
 pub struct App {
     db: Database,
     view: View,
@@ -58,6 +68,12 @@ pub struct App {
     delete_throbber_frame: usize,
     /// Active resume preparation (loading scanned paths)
     resume_prep: Option<ResumePreparation>,
+    /// Active loading task for non-blocking data operations
+    loading_task: Option<tokio::task::JoinHandle<Result<LoadingResult>>>,
+    /// Path of directory currently being loaded (for showing throbber)
+    loading_path: Option<String>,
+    /// Throbber frame for loading animation
+    loading_throbber_frame: usize,
     /// Settings list state for navigation
     settings_list_state: ListState,
     /// File tree sort mode
@@ -108,6 +124,9 @@ impl App {
             delete_task: None,
             delete_throbber_frame: 0,
             resume_prep: None,
+            loading_task: None,
+            loading_path: None,
+            loading_throbber_frame: 0,
             settings_list_state: ListState::default(),
             file_tree_sort: settings.ui.file_tree_sort,
             scan_list_sort: settings.ui.scan_list_sort,
@@ -238,7 +257,7 @@ impl App {
                                 self.g_pressed = false;
                             }
                             KeyCode::Enter | KeyCode::Char('o') => {
-                                if let Err(e) = self.select_scan().await {
+                                if let Err(e) = self.select_scan() {
                                     self.status_message = format!("Error: {}", e);
                                 }
                                 self.g_pressed = false;
@@ -337,12 +356,16 @@ impl App {
                             }
                             KeyCode::Char('z') | KeyCode::Char('o') => {
                                 // Toggle fold/unfold for selected directory (one level)
-                                self.toggle_fold_directory(false);
+                                if let Err(e) = self.toggle_fold_directory(false) {
+                                    self.status_message = format!("Error unfolding: {}", e);
+                                }
                                 self.g_pressed = false;
                             }
                             KeyCode::Char('Z') | KeyCode::Char('O') => {
                                 // Unfold all nested folders recursively
-                                self.toggle_fold_directory(true);
+                                if let Err(e) = self.toggle_fold_directory(true) {
+                                    self.status_message = format!("Error unfolding: {}", e);
+                                }
                                 self.g_pressed = false;
                             }
                             KeyCode::Char('1') => {
@@ -938,6 +961,100 @@ impl App {
                 }
             }
 
+            // Handle active loading task
+            if let Some(loading_task) = &self.loading_task {
+                if loading_task.is_finished() {
+                    // Take ownership of the task to finalize it
+                    if let Some(loading_task) = self.loading_task.take() {
+                        match loading_task.await {
+                            Ok(Ok(result)) => {
+                                match result {
+                                    LoadingResult::ScanEntries(scan_id, entries) => {
+                                        // Set scan as current and populate entries
+                                        if let Some(scan) =
+                                            self.scans.iter().find(|s| s.id == scan_id).cloned()
+                                        {
+                                            self.current_scan = Some(scan);
+                                            self.file_entries = entries;
+                                            self.file_list_state.select(Some(0));
+                                            self.folded_dirs.clear();
+                                            self.initialize_folded_state();
+                                            self.status_message = format!(
+                                                "Loaded {} entries",
+                                                self.file_entries.len()
+                                            );
+                                            self.view = View::FileTree;
+                                        }
+                                    }
+                                    LoadingResult::DirectoryChildren(parent_path, children) => {
+                                        // Save the count before moving
+                                        let child_count = children.len();
+
+                                        // Add children to file_entries if not already there
+                                        for child in children {
+                                            if !self
+                                                .file_entries
+                                                .iter()
+                                                .any(|e| e.path == child.path)
+                                            {
+                                                // Fold directories by default
+                                                if child.is_dir {
+                                                    self.folded_dirs.insert(child.path.clone());
+                                                }
+                                                self.file_entries.push(child);
+                                            }
+                                        }
+                                        // Unfold the parent directory
+                                        self.folded_dirs.remove(&parent_path);
+                                        self.status_message =
+                                            format!("Loaded {} children", child_count);
+                                    }
+                                    LoadingResult::RecursiveChildren(
+                                        parent_path,
+                                        all_descendants,
+                                    ) => {
+                                        // Save the count before moving
+                                        let descendant_count = all_descendants.len();
+
+                                        // Add all descendants to file_entries if not already there
+                                        for child in all_descendants {
+                                            if !self
+                                                .file_entries
+                                                .iter()
+                                                .any(|e| e.path == child.path)
+                                            {
+                                                self.file_entries.push(child);
+                                            }
+                                        }
+                                        // Unfold the parent and all descendants
+                                        self.folded_dirs.remove(&parent_path);
+                                        let prefix = format!("{}/", parent_path);
+                                        self.folded_dirs.retain(|path| !path.starts_with(&prefix));
+                                        self.status_message = format!(
+                                            "Loaded {} descendants recursively",
+                                            descendant_count
+                                        );
+                                    }
+                                }
+                                // Clear loading state
+                                self.loading_path = None;
+                            }
+                            Ok(Err(e)) => {
+                                self.status_message = format!("Loading error: {}", e);
+                                self.loading_path = None;
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Loading task error: {}", e);
+                                self.loading_path = None;
+                            }
+                        }
+                    }
+                } else {
+                    // Update throbber animation
+                    self.loading_throbber_frame = (self.loading_throbber_frame + 1) % 8;
+                }
+            }
+
             // Handle resume preparation (loading scanned paths)
             if let Some(resume_prep) = &self.resume_prep {
                 if resume_prep.load_task.is_finished() {
@@ -1072,19 +1189,26 @@ impl App {
         };
 
         let visible_entries = self.get_visible_entries();
+        let throbber_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+        let throbber = throbber_chars[self.loading_throbber_frame % throbber_chars.len()];
+
         let items: Vec<ListItem> = visible_entries
             .iter()
             .map(|entry| {
                 let size_str = format_size(entry.size as u64);
                 let is_folded = entry.is_dir && self.folded_dirs.contains(&entry.path);
+                let is_loading = self.loading_path.as_ref() == Some(&entry.path);
+
                 let icon = if entry.is_dir {
-                    if is_folded {
-                        "▶ 📁"
+                    if is_loading {
+                        format!("{} 📁", throbber)
+                    } else if is_folded {
+                        "▶ 📁".to_string()
                     } else {
-                        "▼ 📁"
+                        "▼ 📁".to_string()
                     }
                 } else {
-                    "  📄"
+                    "  📄".to_string()
                 };
                 let indent = "  ".repeat(entry.depth as usize);
                 let content = format!("{}{} {} ({})", indent, icon, entry.name, size_str);
@@ -1718,19 +1842,33 @@ impl App {
         Ok(())
     }
 
-    async fn select_scan(&mut self) -> Result<()> {
+    fn select_scan(&mut self) -> Result<()> {
         if let Some(selected) = self.scan_list_state.selected() {
-            if let Some(scan) = self.scans.get(selected) {
-                self.current_scan = Some(scan.clone());
-                self.file_entries = self.db.get_largest_entries(scan.id, 1000).await?;
-                self.file_list_state.select(Some(0));
+            if let Some(scan) = self.scans.get(selected).cloned() {
+                let scan_id = scan.id;
+                let db = self.db.clone();
+
+                // Spawn background task to load entries
+                let loading_task = tokio::spawn(async move {
+                    // Load the root directory and its immediate children
+                    let root = db.get_root_entry(scan_id).await?;
+
+                    let mut entries = Vec::new();
+                    if let Some(root) = root {
+                        // Load root + its immediate children (depth 1)
+                        let children = db.get_entries_by_parent(scan_id, Some(&root.path)).await?;
+                        entries.push(root);
+                        entries.extend(children);
+                    }
+
+                    Ok(LoadingResult::ScanEntries(scan_id, entries))
+                });
+
+                self.loading_task = Some(loading_task);
+                self.loading_path = Some(scan.root_path.clone());
+                self.loading_throbber_frame = 0;
+                self.status_message = format!("Loading scan: {}", scan.root_path);
                 self.view = View::FileTree;
-
-                // Initialize folded state: fold all directories except the root
-                self.folded_dirs.clear();
-                self.initialize_folded_state();
-
-                self.status_message = format!("Loaded {} entries", self.file_entries.len());
             }
         }
         Ok(())
@@ -1745,31 +1883,56 @@ impl App {
         }
     }
 
-    fn toggle_fold_directory(&mut self, recursive: bool) {
+    fn toggle_fold_directory(&mut self, recursive: bool) -> Result<()> {
         if let Some(selected) = self.file_list_state.selected() {
             let visible_entries = self.get_visible_entries();
             if let Some(entry) = visible_entries.get(selected) {
                 if !entry.is_dir {
                     self.status_message = "Not a directory".to_string();
-                    return;
+                    return Ok(());
                 }
 
                 let dir_path = entry.path.clone();
                 let dir_name = entry.name.clone();
-                let dir_depth = entry.depth;
                 let is_folded = self.folded_dirs.contains(&dir_path);
 
                 if is_folded {
-                    // Unfold
-                    if recursive {
-                        // Shift+Z: Unfold all nested folders recursively
-                        self.unfold_recursive(&dir_path);
-                        self.status_message =
-                            format!("Unfolded '{}' and all subdirectories", dir_name);
-                    } else {
-                        // z: Unfold one level only
-                        self.unfold_one_level(&dir_path, dir_depth);
-                        self.status_message = format!("Unfolded '{}'", dir_name);
+                    // Unfold - spawn background task to load children
+                    if let Some(scan) = &self.current_scan {
+                        let scan_id = scan.id;
+                        let db = self.db.clone();
+                        let parent_path = dir_path.clone();
+
+                        if !recursive {
+                            // Non-recursive: load immediate children only
+                            let loading_task = tokio::spawn(async move {
+                                let children = db
+                                    .get_entries_by_parent(scan_id, Some(&parent_path))
+                                    .await?;
+                                Ok(LoadingResult::DirectoryChildren(parent_path, children))
+                            });
+
+                            self.loading_task = Some(loading_task);
+                            self.loading_path = Some(dir_path.clone());
+                            self.loading_throbber_frame = 0;
+                            self.status_message = format!("Loading: {}", dir_name);
+                        } else {
+                            // Recursive: load all descendants
+                            let loading_task = tokio::spawn(async move {
+                                let all_descendants =
+                                    db.get_all_descendants(scan_id, &parent_path).await?;
+                                Ok(LoadingResult::RecursiveChildren(
+                                    parent_path,
+                                    all_descendants,
+                                ))
+                            });
+
+                            self.loading_task = Some(loading_task);
+                            self.loading_path = Some(dir_path.clone());
+                            self.loading_throbber_frame = 0;
+                            self.status_message =
+                                format!("Loading all descendants of: {}", dir_name);
+                        }
                     }
                 } else {
                     // Fold - collapse this directory and all its descendants
@@ -1778,28 +1941,7 @@ impl App {
                 }
             }
         }
-    }
-
-    fn unfold_one_level(&mut self, parent_path: &str, parent_depth: i64) {
-        // Remove the parent from folded set
-        self.folded_dirs.remove(parent_path);
-
-        // Ensure all immediate subdirectories are folded
-        let target_depth = parent_depth + 1;
-        for entry in &self.file_entries {
-            if entry.is_dir && entry.depth == target_depth {
-                // Check if this is a direct child of parent_path
-                if entry.path.starts_with(parent_path) && entry.path != parent_path {
-                    // Count slashes to verify it's a direct child
-                    let relative_path = &entry.path[parent_path.len()..];
-                    let slash_count = relative_path.chars().filter(|c| *c == '/').count();
-                    // Direct child should have exactly 1 slash (the leading one)
-                    if slash_count == 1 {
-                        self.folded_dirs.insert(entry.path.clone());
-                    }
-                }
-            }
-        }
+        Ok(())
     }
 
     fn fold_directory(&mut self, dir_path: &str) {
@@ -1807,15 +1949,6 @@ impl App {
         self.folded_dirs.insert(dir_path.to_string());
 
         // We don't need to fold children since they'll be hidden anyway
-    }
-
-    fn unfold_recursive(&mut self, parent_path: &str) {
-        // Remove the parent and all children from folded set
-        self.folded_dirs.remove(parent_path);
-
-        // Remove all paths that start with parent_path/
-        let prefix = format!("{}/", parent_path);
-        self.folded_dirs.retain(|path| !path.starts_with(&prefix));
     }
 
     fn get_visible_entries(&self) -> Vec<&StoredFileEntry> {

@@ -80,6 +80,22 @@ fn sort_hierarchically_by_size(entries: &mut Vec<&StoredFileEntry>) {
         .map(|(i, e)| (e.path.as_str(), i))
         .collect();
 
+    // Build a parent→children mapping for O(1) child lookups
+    let mut parent_to_children: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if let Some(parent_path) = &entry.parent_path {
+            parent_to_children
+                .entry(parent_path.as_str())
+                .or_insert_with(Vec::new)
+                .push(idx);
+        }
+    }
+
+    // Sort each parent's children by size (descending)
+    for children in parent_to_children.values_mut() {
+        children.sort_by(|&a, &b| entries[b].size.cmp(&entries[a].size));
+    }
+
     // Recursively sort entries starting from roots (entries whose parents aren't in the list)
     let mut sorted = Vec::new();
     let mut processed = HashSet::new();
@@ -95,7 +111,13 @@ fn sort_hierarchically_by_size(entries: &mut Vec<&StoredFileEntry>) {
                 .is_none_or(|parent| !path_to_idx.contains_key(parent.as_str()));
 
         if is_root {
-            sort_subtree(idx, entries, &path_to_idx, &mut sorted, &mut processed);
+            sort_subtree(
+                idx,
+                entries,
+                &parent_to_children,
+                &mut sorted,
+                &mut processed,
+            );
         }
     }
 
@@ -109,7 +131,7 @@ fn sort_hierarchically_by_size(entries: &mut Vec<&StoredFileEntry>) {
 fn sort_subtree<'a>(
     idx: usize,
     all_entries: &[&'a StoredFileEntry],
-    _path_to_idx: &HashMap<&str, usize>,
+    parent_to_children: &HashMap<&str, Vec<usize>>,
     sorted: &mut Vec<&'a StoredFileEntry>,
     processed: &mut HashSet<usize>,
 ) {
@@ -121,27 +143,20 @@ fn sort_subtree<'a>(
     sorted.push(entry);
     processed.insert(idx);
 
-    // Find all children of this entry
-    let mut children_indices = Vec::new();
-    for (child_idx, child) in all_entries.iter().enumerate() {
-        if processed.contains(&child_idx) {
-            continue;
-        }
-
-        // Check if this child's parent is the current entry
-        if let Some(parent_path) = &child.parent_path {
-            if parent_path == &entry.path {
-                children_indices.push(child_idx);
+    // Look up pre-sorted children from the index (O(1) lookup)
+    if let Some(children_indices) = parent_to_children.get(entry.path.as_str()) {
+        // Children are already sorted by size in the map
+        for &child_idx in children_indices {
+            if !processed.contains(&child_idx) {
+                sort_subtree(
+                    child_idx,
+                    all_entries,
+                    parent_to_children,
+                    sorted,
+                    processed,
+                );
             }
         }
-    }
-
-    // Sort children by size (descending)
-    children_indices.sort_by(|&a, &b| all_entries[b].size.cmp(&all_entries[a].size));
-
-    // Recursively process each child
-    for child_idx in children_indices {
-        sort_subtree(child_idx, all_entries, _path_to_idx, sorted, processed);
     }
 }
 

@@ -122,7 +122,8 @@ async fn test_full_scan_workflow() {
     let path_clone = temp_fs.path().to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
     let scan_result = tokio::task::spawn_blocking(move || {
-        let scanner = Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled);
+        let scanner =
+            Scanner::with_sender(&path_clone, tx_clone, Some(progress_tx), cancelled, false);
         scanner.scan()
     })
     .await
@@ -193,11 +194,11 @@ async fn test_concurrent_scans() {
     let cancelled2 = Arc::new(AtomicBool::new(false));
     let (result1, result2) = tokio::join!(
         tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::with_sender(&path1, tx1, None, cancelled1);
+            let scanner = Scanner::with_sender(&path1, tx1, None, cancelled1, false);
             scanner.scan()
         }),
         tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::with_sender(&path2, tx2, None, cancelled2);
+            let scanner = Scanner::with_sender(&path2, tx2, None, cancelled2, false);
             scanner.scan()
         })
     );
@@ -240,7 +241,7 @@ async fn test_cleanup_workflow() {
     let path_clone = temp_fs.path().to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
     let scan_result = tokio::task::spawn_blocking(move || {
-        let scanner = Scanner::with_sender(&path_clone, tx, None, cancelled);
+        let scanner = Scanner::with_sender(&path_clone, tx, None, cancelled, false);
         scanner.scan()
     })
     .await
@@ -304,7 +305,7 @@ async fn test_large_batch_processing() {
     let path_clone = root.to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
     let scan_result = tokio::task::spawn_blocking(move || {
-        let scanner = Scanner::with_sender(&path_clone, tx, None, cancelled);
+        let scanner = Scanner::with_sender(&path_clone, tx, None, cancelled, false);
         scanner.scan()
     })
     .await

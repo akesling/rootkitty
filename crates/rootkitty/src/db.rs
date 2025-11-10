@@ -376,7 +376,37 @@ impl Database {
         Ok(entries)
     }
 
-    #[allow(dead_code)]
+    pub async fn get_root_entry(&self, scan_id: i64) -> Result<Option<StoredFileEntry>> {
+        let row = sqlx::query(
+            "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
+             FROM file_entries WHERE scan_id = ? AND depth = 0 LIMIT 1",
+        )
+        .bind(scan_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = row {
+            let modified_at_str: Option<String> = row.get("modified_at");
+            Ok(Some(StoredFileEntry {
+                id: row.get("id"),
+                scan_id: row.get("scan_id"),
+                path: row.get("path"),
+                name: row.get("name"),
+                parent_path: row.get("parent_path"),
+                size: row.get("size"),
+                is_dir: row.get("is_dir"),
+                modified_at: modified_at_str.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                }),
+                depth: row.get("depth"),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn get_entries_by_parent(
         &self,
         scan_id: i64,
@@ -400,6 +430,54 @@ impl Database {
             .fetch_all(&self.pool)
             .await?
         };
+
+        let entries = rows
+            .iter()
+            .map(|row| {
+                let modified_at_str: Option<String> = row.get("modified_at");
+
+                StoredFileEntry {
+                    id: row.get("id"),
+                    scan_id: row.get("scan_id"),
+                    path: row.get("path"),
+                    name: row.get("name"),
+                    parent_path: row.get("parent_path"),
+                    size: row.get("size"),
+                    is_dir: row.get("is_dir"),
+                    modified_at: modified_at_str.and_then(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    }),
+                    depth: row.get("depth"),
+                }
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get all descendants of a directory recursively (all files/dirs under the parent path)
+    pub async fn get_all_descendants(
+        &self,
+        scan_id: i64,
+        parent_path: &str,
+    ) -> Result<Vec<StoredFileEntry>> {
+        // Use path prefix matching to get all descendants
+        // We match paths that start with "parent_path/"
+        let prefix_pattern = format!("{}/%", parent_path);
+
+        let rows = sqlx::query(
+            "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
+             FROM file_entries
+             WHERE scan_id = ? AND (path LIKE ? OR parent_path = ?)
+             ORDER BY path",
+        )
+        .bind(scan_id)
+        .bind(&prefix_pattern)
+        .bind(parent_path)
+        .fetch_all(&self.pool)
+        .await?;
 
         let entries = rows
             .iter()

@@ -287,15 +287,50 @@ impl Scanner {
         // Use jwalk to traverse in PARALLEL (faster than single-threaded walkdir)!
         let walker = WalkDir::new(&self.root_path)
             .follow_links(self.follow_symlinks)
+            .skip_hidden(false) // Include hidden files (files starting with .)
             .into_iter()
             .filter_map(|e| e.ok());
 
         // Collect all entries (jwalk does parallel traversal internally)
-        let mut all_entries: Vec<_> = walker.collect();
+        // Also track progress during collection
+        let mut all_entries: Vec<_> = Vec::new();
+        let mut count = 0;
+        let mut current_dir = String::new();
 
-        // Filter out symlinks if follow_symlinks is false
-        if !self.follow_symlinks {
-            all_entries.retain(|entry| !entry.file_type().is_symlink());
+        for entry in walker {
+            // Check if cancelled
+            if self.cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Scan cancelled"));
+            }
+
+            // Filter out symlinks if follow_symlinks is false
+            if !self.follow_symlinks && entry.file_type().is_symlink() {
+                continue;
+            }
+
+            // Track current directory being scanned
+            if entry.file_type().is_dir() {
+                current_dir = entry.path().display().to_string();
+            }
+
+            all_entries.push(entry);
+
+            // Send progress updates periodically during collection
+            count += 1;
+            if let Some(progress_tx) = &self.progress_sender {
+                if count % PROGRESS_UPDATE_INTERVAL == 0 {
+                    // For hybrid scanner, we don't have per-directory progress,
+                    // but we can show which directory we're currently processing
+                    let _ = progress_tx.send(ProgressUpdate {
+                        files_scanned: count,
+                        dirs_scanned: 0,
+                        total_size: 0,
+                        current_path: current_dir.clone(),
+                        active_dirs: vec![], // No per-directory progress for hybrid
+                        active_workers: 1,   // jwalk uses internal parallelism
+                    });
+                }
+            }
         }
 
         // Single-pass parallel processing: compute dir_sizes AND stats at the same time!
@@ -1276,6 +1311,242 @@ mod tests {
                     impl_name, stats.total_files
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_hidden_files_are_scanned() {
+        use std::fs;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create regular files
+        fs::write(root.join("regular.txt"), b"regular content").unwrap();
+        fs::write(root.join("another.txt"), b"another content").unwrap();
+
+        // Create hidden files (prefixed with .)
+        fs::write(root.join(".hidden.txt"), b"hidden content").unwrap();
+        fs::write(root.join(".dotfile"), b"dotfile content").unwrap();
+
+        // Create hidden directory with files
+        fs::create_dir(root.join(".hidden_dir")).unwrap();
+        fs::write(root.join(".hidden_dir/file.txt"), b"nested in hidden").unwrap();
+        fs::write(
+            root.join(".hidden_dir/.nested_hidden.txt"),
+            b"double hidden",
+        )
+        .unwrap();
+
+        // Test all three implementations
+        for (impl_name, scanner_impl) in [
+            ("Custom", ScannerImpl::Custom),
+            ("Walkdir", ScannerImpl::Walkdir),
+            ("Hybrid", ScannerImpl::Hybrid),
+        ] {
+            println!("Testing {} implementation for hidden files", impl_name);
+
+            let scanner = Scanner::new_with_impl(root, scanner_impl);
+            let (entries, stats) = scanner.scan().unwrap();
+
+            // Count all files (including hidden)
+            let all_files: Vec<_> = entries.iter().filter(|e| !e.is_dir).collect();
+
+            println!("{}: Found {} files total", impl_name, all_files.len());
+            println!(
+                "{}: File names: {:?}",
+                impl_name,
+                all_files.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+
+            // Should find all files including hidden ones:
+            // - regular.txt
+            // - another.txt
+            // - .hidden.txt
+            // - .dotfile
+            // - .hidden_dir/file.txt
+            // - .hidden_dir/.nested_hidden.txt
+            assert_eq!(
+                all_files.len(),
+                6,
+                "{}: Should find exactly 6 files (2 regular + 2 hidden + 2 in hidden dir), found: {:?}",
+                impl_name,
+                all_files.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+
+            assert_eq!(
+                stats.total_files, 6,
+                "{}: total_files should be 6",
+                impl_name
+            );
+
+            // Verify specific hidden files are found
+            let has_hidden_txt = entries.iter().any(|e| e.name == ".hidden.txt");
+            let has_dotfile = entries.iter().any(|e| e.name == ".dotfile");
+            let has_hidden_dir = entries.iter().any(|e| e.name == ".hidden_dir" && e.is_dir);
+            let has_nested_hidden = entries.iter().any(|e| e.name == ".nested_hidden.txt");
+
+            assert!(has_hidden_txt, "{}: Should find .hidden.txt", impl_name);
+            assert!(has_dotfile, "{}: Should find .dotfile", impl_name);
+            assert!(
+                has_hidden_dir,
+                "{}: Should find .hidden_dir directory",
+                impl_name
+            );
+            assert!(
+                has_nested_hidden,
+                "{}: Should find .nested_hidden.txt inside .hidden_dir",
+                impl_name
+            );
+
+            // Verify directories count includes hidden directory
+            // root + .hidden_dir = 2 directories
+            assert_eq!(
+                stats.total_dirs, 2,
+                "{}: Should find 2 directories (root + .hidden_dir)",
+                impl_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_directory_size_calculation_all_implementations() {
+        use std::fs;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create a directory structure with known sizes
+        // root/
+        //   file1.txt (6 bytes)
+        //   file2.txt (10 bytes)
+        //   subdir1/
+        //     file3.txt (5 bytes)
+        //     file4.txt (8 bytes)
+        //   subdir2/
+        //     nested/
+        //       file5.txt (12 bytes)
+
+        fs::write(root.join("file1.txt"), b"hello\n").unwrap(); // 6 bytes
+        fs::write(root.join("file2.txt"), b"0123456789").unwrap(); // 10 bytes
+
+        fs::create_dir(root.join("subdir1")).unwrap();
+        fs::write(root.join("subdir1/file3.txt"), b"test\n").unwrap(); // 5 bytes
+        fs::write(root.join("subdir1/file4.txt"), b"testing\n").unwrap(); // 8 bytes
+
+        fs::create_dir(root.join("subdir2")).unwrap();
+        fs::create_dir(root.join("subdir2/nested")).unwrap();
+        fs::write(root.join("subdir2/nested/file5.txt"), b"hello world\n").unwrap(); // 12 bytes
+
+        // Expected sizes:
+        // file1.txt: 6
+        // file2.txt: 10
+        // file3.txt: 5
+        // file4.txt: 8
+        // file5.txt: 12
+        // subdir1: 5 + 8 = 13
+        // subdir2/nested: 12
+        // subdir2: 12
+        // root: 6 + 10 + 13 + 12 = 41
+
+        // Test all three implementations
+        for (impl_name, scanner_impl) in [
+            ("Custom", ScannerImpl::Custom),
+            ("Walkdir", ScannerImpl::Walkdir),
+            ("Hybrid", ScannerImpl::Hybrid),
+        ] {
+            println!("Testing {} implementation for directory sizes", impl_name);
+
+            let scanner = Scanner::new_with_impl(root, scanner_impl);
+            let (entries, stats) = scanner.scan().unwrap();
+
+            // Find specific entries
+            let root_entry = entries.iter().find(|e| e.path == root).unwrap();
+            let subdir1_entry = entries.iter().find(|e| e.name == "subdir1").unwrap();
+            let subdir2_entry = entries.iter().find(|e| e.name == "subdir2").unwrap();
+            let nested_entry = entries.iter().find(|e| e.name == "nested").unwrap();
+            let file1_entry = entries.iter().find(|e| e.name == "file1.txt").unwrap();
+            let file2_entry = entries.iter().find(|e| e.name == "file2.txt").unwrap();
+            let file3_entry = entries.iter().find(|e| e.name == "file3.txt").unwrap();
+            let file4_entry = entries.iter().find(|e| e.name == "file4.txt").unwrap();
+            let file5_entry = entries.iter().find(|e| e.name == "file5.txt").unwrap();
+
+            println!(
+                "{}: Root size: {}, subdir1: {}, subdir2: {}, nested: {}",
+                impl_name,
+                root_entry.size,
+                subdir1_entry.size,
+                subdir2_entry.size,
+                nested_entry.size
+            );
+
+            // Verify file sizes
+            assert_eq!(
+                file1_entry.size, 6,
+                "{}: file1.txt should be 6 bytes",
+                impl_name
+            );
+            assert_eq!(
+                file2_entry.size, 10,
+                "{}: file2.txt should be 10 bytes",
+                impl_name
+            );
+            assert_eq!(
+                file3_entry.size, 5,
+                "{}: file3.txt should be 5 bytes",
+                impl_name
+            );
+            assert_eq!(
+                file4_entry.size, 8,
+                "{}: file4.txt should be 8 bytes",
+                impl_name
+            );
+            assert_eq!(
+                file5_entry.size, 12,
+                "{}: file5.txt should be 12 bytes",
+                impl_name
+            );
+
+            // Verify directory sizes (sum of all files within)
+            assert_eq!(
+                nested_entry.size, 12,
+                "{}: nested dir should be 12 bytes (file5.txt only)",
+                impl_name
+            );
+            assert_eq!(
+                subdir2_entry.size, 12,
+                "{}: subdir2 should be 12 bytes (nested dir contents)",
+                impl_name
+            );
+            assert_eq!(
+                subdir1_entry.size, 13,
+                "{}: subdir1 should be 13 bytes (5 + 8)",
+                impl_name
+            );
+            assert_eq!(
+                root_entry.size,
+                41,
+                "{}: root should be 41 bytes (6 + 10 + 13 + 12). Got files: {:?} with sizes {:?}",
+                impl_name,
+                entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .map(|e| &e.name)
+                    .collect::<Vec<_>>(),
+                entries
+                    .iter()
+                    .filter(|e| !e.is_dir)
+                    .map(|e| e.size)
+                    .collect::<Vec<_>>()
+            );
+
+            // Verify total stats
+            assert_eq!(
+                stats.total_size, 41,
+                "{}: total_size should be 41 bytes",
+                impl_name
+            );
+            assert_eq!(stats.total_files, 5, "{}: should have 5 files", impl_name);
         }
     }
 }

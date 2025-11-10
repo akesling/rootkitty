@@ -122,24 +122,31 @@ async fn main() -> Result<()> {
 
                     // Show active directories (limit to top 4 for readability)
                     let max_display = 4;
-                    for (dir_path, done, total) in progress.active_dirs.iter().take(max_display) {
-                        let percentage = if *total > 0 {
-                            (*done as f64 / *total as f64 * 100.0) as usize
-                        } else {
-                            0
-                        };
+                    if !progress.active_dirs.is_empty() {
+                        for (dir_path, done, total) in progress.active_dirs.iter().take(max_display)
+                        {
+                            let percentage = if *total > 0 {
+                                (*done as f64 / *total as f64 * 100.0) as usize
+                            } else {
+                                0
+                            };
 
-                        // Show intelligently truncated path
-                        let display_path = smart_truncate_path(dir_path, 70);
+                            // Show intelligently truncated path
+                            let display_path = smart_truncate_path(dir_path, 70);
 
-                        println!("  [{}/{}] {:>3}% {}", done, total, percentage, display_path);
-                    }
+                            println!("  [{}/{}] {:>3}% {}", done, total, percentage, display_path);
+                        }
 
-                    if progress.active_dirs.len() > max_display {
-                        println!(
-                            "  ... and {} more directories",
-                            progress.active_dirs.len() - max_display
-                        );
+                        if progress.active_dirs.len() > max_display {
+                            println!(
+                                "  ... and {} more directories",
+                                progress.active_dirs.len() - max_display
+                            );
+                        }
+                    } else if !progress.current_path.is_empty() {
+                        // If no per-directory progress, just show current path
+                        let display_path = smart_truncate_path(&progress.current_path, 70);
+                        println!("  Scanning: {}", display_path);
                     }
 
                     std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -217,24 +224,31 @@ async fn main() -> Result<()> {
 
                     // Show active directories (limit to top 4 for readability)
                     let max_display = 4;
-                    for (dir_path, done, total) in progress.active_dirs.iter().take(max_display) {
-                        let percentage = if *total > 0 {
-                            (*done as f64 / *total as f64 * 100.0) as usize
-                        } else {
-                            0
-                        };
+                    if !progress.active_dirs.is_empty() {
+                        for (dir_path, done, total) in progress.active_dirs.iter().take(max_display)
+                        {
+                            let percentage = if *total > 0 {
+                                (*done as f64 / *total as f64 * 100.0) as usize
+                            } else {
+                                0
+                            };
 
-                        // Show intelligently truncated path
-                        let display_path = smart_truncate_path(dir_path, 70);
+                            // Show intelligently truncated path
+                            let display_path = smart_truncate_path(dir_path, 70);
 
-                        println!("  [{}/{}] {:>3}% {}", done, total, percentage, display_path);
-                    }
+                            println!("  [{}/{}] {:>3}% {}", done, total, percentage, display_path);
+                        }
 
-                    if progress.active_dirs.len() > max_display {
-                        println!(
-                            "  ... and {} more directories",
-                            progress.active_dirs.len() - max_display
-                        );
+                        if progress.active_dirs.len() > max_display {
+                            println!(
+                                "  ... and {} more directories",
+                                progress.active_dirs.len() - max_display
+                            );
+                        }
+                    } else if !progress.current_path.is_empty() {
+                        // If no per-directory progress, just show current path
+                        let display_path = smart_truncate_path(&progress.current_path, 70);
+                        println!("  Scanning: {}", display_path);
                     }
 
                     std::io::Write::flush(&mut std::io::stdout()).ok();
