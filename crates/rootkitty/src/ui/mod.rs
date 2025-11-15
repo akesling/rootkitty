@@ -102,6 +102,8 @@ pub struct App {
     follow_symlinks: bool,
     /// Search query string for filtering file tree
     search_query: String,
+    /// Whether we're actively in search input mode
+    search_mode: bool,
 }
 
 impl App {
@@ -145,6 +147,7 @@ impl App {
             pending_path_exists: false,
             follow_symlinks: settings.scan.follow_symlinks,
             search_query: String::new(),
+            search_mode: false,
         }
     }
 
@@ -301,133 +304,167 @@ impl App {
                                 self.g_pressed = false;
                             }
                         },
-                        View::FileTree => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Esc => {
-                                // If search is active, clear it; otherwise go back to scan list
-                                if !self.search_query.is_empty() {
-                                    self.search_query.clear();
-                                    self.status_message = "Search cleared".to_string();
-                                } else {
-                                    self.view = View::ScanList;
+                        View::FileTree => {
+                            // Handle search mode separately
+                            if self.search_mode {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        // Exit search mode and clear query
+                                        self.search_mode = false;
+                                        self.search_query.clear();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Enter => {
+                                        // Exit search mode but keep the query active
+                                        self.search_mode = false;
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Backspace => {
+                                        self.search_query.pop();
+                                        // Reset to top when search changes
+                                        if !self.get_visible_entries().is_empty() {
+                                            self.file_list_state.select(Some(0));
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        self.search_query.push(c);
+                                        // Reset to top when search changes
+                                        if !self.get_visible_entries().is_empty() {
+                                            self.file_list_state.select(Some(0));
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('?') => {
-                                self.previous_view = View::FileTree;
-                                self.view = View::Help;
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('g') => {
-                                if self.g_pressed {
-                                    // gg - jump to top
-                                    self.file_list_top();
-                                    self.g_pressed = false;
-                                } else {
-                                    self.g_pressed = true;
+                            } else {
+                                // Normal file tree navigation
+                                match key.code {
+                                    KeyCode::Char('q') => return Ok(()),
+                                    KeyCode::Esc => {
+                                        // If search query is active, clear it; otherwise go back to scan list
+                                        if !self.search_query.is_empty() {
+                                            self.search_query.clear();
+                                        } else {
+                                            self.view = View::ScanList;
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('?') => {
+                                        self.previous_view = View::FileTree;
+                                        self.view = View::Help;
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('g') => {
+                                        if self.g_pressed {
+                                            // gg - jump to top
+                                            self.file_list_top();
+                                            self.g_pressed = false;
+                                        } else {
+                                            self.g_pressed = true;
+                                        }
+                                    }
+                                    KeyCode::Char('G') => {
+                                        // Shift+G - jump to bottom
+                                        self.file_list_bottom();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        self.file_list_next();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        self.file_list_previous();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('J') => {
+                                        // Shift+J - jump to next sibling (same depth)
+                                        self.file_list_next_sibling();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('K') => {
+                                        // Shift+K - jump to previous sibling (same depth)
+                                        self.file_list_previous_sibling();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('d') => {
+                                        // Page down
+                                        self.file_list_page_down();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('u') => {
+                                        // Page up
+                                        self.file_list_page_up();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        if let Err(e) = self.toggle_cleanup_mark().await {
+                                            self.status_message = format!("Error: {}", e);
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('z') | KeyCode::Char('o') => {
+                                        // Toggle fold/unfold for selected directory (one level)
+                                        if let Err(e) = self.toggle_fold_directory(false) {
+                                            self.status_message = format!("Error unfolding: {}", e);
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('Z') | KeyCode::Char('O') => {
+                                        // Unfold all nested folders recursively
+                                        if let Err(e) = self.toggle_fold_directory(true) {
+                                            self.status_message = format!("Error unfolding: {}", e);
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('s') => {
+                                        // Open shell in selected directory or parent
+                                        if let Err(e) = self.open_shell(terminal) {
+                                            self.status_message =
+                                                format!("Error opening shell: {}", e);
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('1') => {
+                                        self.view = View::ScanList;
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('2') => {
+                                        self.view = View::FileTree;
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('3') => {
+                                        if let Err(e) = self.load_cleanup_items().await {
+                                            self.status_message = format!("Error: {}", e);
+                                        } else {
+                                            self.view = View::CleanupList;
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('t') => {
+                                        self.file_tree_sort = self.file_tree_sort.toggle();
+                                        self.status_message = format!(
+                                            "File tree sort: {}",
+                                            self.file_tree_sort.display_name()
+                                        );
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('S') => {
+                                        // Shift+S - open settings
+                                        self.previous_view = View::FileTree;
+                                        self.view = View::Settings;
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('/') => {
+                                        // Enter search mode (inline at bottom)
+                                        // Keep existing query if there is one
+                                        self.search_mode = true;
+                                        self.g_pressed = false;
+                                    }
+                                    _ => {
+                                        self.g_pressed = false;
+                                    }
                                 }
                             }
-                            KeyCode::Char('G') => {
-                                // Shift+G - jump to bottom
-                                self.file_list_bottom();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                self.file_list_next();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                self.file_list_previous();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('J') => {
-                                // Shift+J - jump to next sibling (same depth)
-                                self.file_list_next_sibling();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('K') => {
-                                // Shift+K - jump to previous sibling (same depth)
-                                self.file_list_previous_sibling();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('d') => {
-                                // Page down
-                                self.file_list_page_down();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('u') => {
-                                // Page up
-                                self.file_list_page_up();
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char(' ') => {
-                                if let Err(e) = self.toggle_cleanup_mark().await {
-                                    self.status_message = format!("Error: {}", e);
-                                }
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('z') | KeyCode::Char('o') => {
-                                // Toggle fold/unfold for selected directory (one level)
-                                if let Err(e) = self.toggle_fold_directory(false) {
-                                    self.status_message = format!("Error unfolding: {}", e);
-                                }
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('Z') | KeyCode::Char('O') => {
-                                // Unfold all nested folders recursively
-                                if let Err(e) = self.toggle_fold_directory(true) {
-                                    self.status_message = format!("Error unfolding: {}", e);
-                                }
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('s') => {
-                                // Open shell in selected directory or parent
-                                if let Err(e) = self.open_shell(terminal) {
-                                    self.status_message = format!("Error opening shell: {}", e);
-                                }
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('1') => {
-                                self.view = View::ScanList;
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('2') => {
-                                self.view = View::FileTree;
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('3') => {
-                                if let Err(e) = self.load_cleanup_items().await {
-                                    self.status_message = format!("Error: {}", e);
-                                } else {
-                                    self.view = View::CleanupList;
-                                }
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('t') => {
-                                self.file_tree_sort = self.file_tree_sort.toggle();
-                                self.status_message = format!(
-                                    "File tree sort: {}",
-                                    self.file_tree_sort.display_name()
-                                );
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('S') => {
-                                // Shift+S - open settings
-                                self.previous_view = View::FileTree;
-                                self.view = View::Settings;
-                                self.g_pressed = false;
-                            }
-                            KeyCode::Char('/') => {
-                                // Open search dialog
-                                self.previous_view = View::FileTree;
-                                self.view = View::SearchDialog;
-                                self.search_query.clear();
-                                self.g_pressed = false;
-                            }
-                            _ => {
-                                self.g_pressed = false;
-                            }
-                        },
+                        }
                         View::CleanupList => match key.code {
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Esc => {
@@ -880,33 +917,6 @@ impl App {
                                 }
                             }
                         }
-                        View::SearchDialog => match key.code {
-                            KeyCode::Esc => {
-                                // Cancel search and return to file tree
-                                self.view = self.previous_view;
-                                self.search_query.clear();
-                            }
-                            KeyCode::Enter => {
-                                // Apply search and return to file tree
-                                self.view = self.previous_view;
-                                // Keep the search_query so filtering remains active
-                                if !self.search_query.is_empty() {
-                                    self.status_message =
-                                        format!("Searching for: {}", self.search_query);
-                                    // Reset file list to top when search is applied
-                                    self.file_list_state.select(Some(0));
-                                } else {
-                                    self.status_message = "Search cleared".to_string();
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                self.search_query.pop();
-                            }
-                            KeyCode::Char(c) => {
-                                self.search_query.push(c);
-                            }
-                            _ => {}
-                        },
                     }
                 }
             }
@@ -1148,14 +1158,14 @@ impl App {
                 .constraints([
                     Constraint::Min(0),    // Main content
                     Constraint::Length(6), // Info pane
-                    Constraint::Length(3), // Status bar
+                    Constraint::Length(1), // Status bar (single line)
                 ])
                 .split(f.area());
             (chunks, true)
         } else {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
                 .split(f.area());
             (chunks, false)
         };
@@ -1177,11 +1187,16 @@ impl App {
             View::PreparingResume => self.render_preparing_resume(f, main_chunks[0]),
             View::Settings => self.render_settings(f, main_chunks[0]),
             View::ConfirmPathChange => self.render_confirm_path_change(f, main_chunks[0]),
-            View::SearchDialog => self.render_search_dialog(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
-        self.render_status_bar(f, main_chunks[status_idx]);
+
+        // Render search bar over status bar if in search mode
+        if self.search_mode && self.view == View::FileTree {
+            self.render_search_bar(f, main_chunks[status_idx]);
+        } else {
+            self.render_status_bar(f, main_chunks[status_idx]);
+        }
     }
 
     fn render_scan_list(&mut self, f: &mut Frame, area: Rect) {
@@ -1382,27 +1397,6 @@ impl App {
 
         let paragraph = Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL).title("New Scan"))
-            .wrap(Wrap { trim: false });
-
-        f.render_widget(paragraph, area);
-    }
-
-    fn render_search_dialog(&self, f: &mut Frame, area: Rect) {
-        let text = vec![
-            Line::from(""),
-            Line::from("Search files by name or path:"),
-            Line::from(""),
-            Line::from(vec![Span::styled(
-                &self.search_query,
-                Style::default().fg(Color::Cyan),
-            )]),
-            Line::from(""),
-            Line::from("Press Enter to apply search, Esc to cancel"),
-            Line::from("(Case-insensitive search)"),
-        ];
-
-        let paragraph = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title("Search Files"))
             .wrap(Wrap { trim: false });
 
         f.render_widget(paragraph, area);
@@ -1880,23 +1874,41 @@ impl App {
             View::ConfirmPathChange => {
                 "y: apply change | n/Esc: keep old path"
             }
-            View::SearchDialog => {
-                "Enter: apply search | Esc: cancel | Type to search files by name or path"
-            }
         };
 
-        let text = vec![
+        // Combine status message and help text into a single line
+        // If there's a status message, show it with a separator; otherwise just show help
+        let status_line = if self.status_message.is_empty() {
             Line::from(vec![Span::styled(
-                &self.status_message,
-                Style::default().fg(Color::Yellow),
-            )]),
-            Line::from(vec![Span::raw(help_text)]),
-        ];
+                help_text,
+                Style::default().fg(Color::Gray),
+            )])
+        } else {
+            Line::from(vec![
+                Span::styled(&self.status_message, Style::default().fg(Color::Yellow)),
+                Span::raw(" | "),
+                Span::styled(help_text, Style::default().fg(Color::Gray)),
+            ])
+        };
 
-        let paragraph = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title("Status"))
-            .wrap(Wrap { trim: true });
+        let paragraph = Paragraph::new(vec![status_line]);
 
+        f.render_widget(paragraph, area);
+    }
+
+    fn render_search_bar(&self, f: &mut Frame, area: Rect) {
+        // Show search prompt with current query
+        let search_line = Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&self.search_query, Style::default().fg(Color::Yellow)),
+            Span::raw("█"), // Cursor
+            Span::styled(
+                "  (Enter to keep, Esc to cancel)",
+                Style::default().fg(Color::Gray),
+            ),
+        ]);
+
+        let paragraph = Paragraph::new(vec![search_line]);
         f.render_widget(paragraph, area);
     }
 
