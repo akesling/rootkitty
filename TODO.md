@@ -6,3 +6,5 @@
   potentially better batching?)
 * Allow resumption of paused/cancelled scan for _only_ a given subtree of the
   scan so far
+* Show visualizations of space usage: tree view being most important, but also
+  progressive pie chart might be valuable?

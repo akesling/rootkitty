@@ -5,24 +5,87 @@ use std::collections::{HashMap, HashSet};
 
 pub use super::types::SortMode;
 
-/// Pure function to compute visible entries based on folded state
+/// Pure function to compute visible entries based on folded state and optional search query
 ///
 /// This function:
 /// 1. Filters out entries whose parent directories are folded
-/// 2. Sorts the remaining entries based on the sort mode
+/// 2. Filters by search query if provided (case-insensitive match on name or path)
+///    - When searching, includes parent directories of matching items for context
+/// 3. Sorts the remaining entries based on the sort mode
 pub fn compute_visible_entries<'a>(
     all_entries: &'a [StoredFileEntry],
     folded_dirs: &HashSet<String>,
     sort_mode: SortMode,
+    search_query: Option<&str>,
 ) -> Vec<&'a StoredFileEntry> {
     // Step 1: Filter to only visible entries (not under folded directories)
-    let visible: Vec<&StoredFileEntry> = all_entries
+    let unfolded: Vec<&StoredFileEntry> = all_entries
         .iter()
         .filter(|entry| !is_entry_hidden(entry, folded_dirs))
         .collect();
 
-    // Step 2: Sort based on mode
+    // Step 2: Apply search filter if query is provided
+    let visible = if let Some(query) = search_query {
+        if query.is_empty() {
+            unfolded
+        } else {
+            apply_search_filter(&unfolded, query)
+        }
+    } else {
+        unfolded
+    };
+
+    // Step 3: Sort based on mode
     sort_entries(visible, sort_mode)
+}
+
+/// Apply search filter and include parent directories of matching items
+/// This ensures the full path from root to each match is visible
+fn apply_search_filter<'a>(
+    entries: &[&'a StoredFileEntry],
+    query: &str,
+) -> Vec<&'a StoredFileEntry> {
+    let query_lower = query.to_lowercase();
+
+    // Find all entries that match the search query
+    let matching_entries: HashSet<&str> = entries
+        .iter()
+        .filter(|entry| {
+            entry.name.to_lowercase().contains(&query_lower)
+                || entry.path.to_lowercase().contains(&query_lower)
+        })
+        .map(|e| e.path.as_str())
+        .collect();
+
+    // Build set of all paths to include (matches + their ancestors)
+    let mut paths_to_include = HashSet::new();
+
+    for matching_path in &matching_entries {
+        // Add the matching entry itself
+        paths_to_include.insert(*matching_path);
+
+        // Add all parent directories
+        let mut current_path = *matching_path;
+        while let Some(parent_path) = get_parent_path(current_path) {
+            if !paths_to_include.insert(parent_path) {
+                // Already added this parent (and thus all its ancestors)
+                break;
+            }
+            current_path = parent_path;
+        }
+    }
+
+    // Filter entries to only those in our include set
+    entries
+        .iter()
+        .filter(|entry| paths_to_include.contains(entry.path.as_str()))
+        .copied()
+        .collect()
+}
+
+/// Get the parent path from a path string
+fn get_parent_path(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
 }
 
 /// Check if an entry is hidden because a parent directory is folded
@@ -237,7 +300,7 @@ mod tests {
         let entries = create_test_fixture();
         let folded = HashSet::new();
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         assert_eq!(visible.len(), 12);
@@ -251,7 +314,7 @@ mod tests {
         let entries = create_test_fixture();
         let folded = HashSet::new();
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         assert_eq!(visible.len(), 12);
@@ -277,7 +340,7 @@ mod tests {
         let mut folded = HashSet::new();
         folded.insert("/project/src/utils".to_string());
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         assert!(
@@ -299,7 +362,7 @@ mod tests {
 
         // Test both sort modes
         for sort_mode in [SortMode::ByPath, SortMode::BySize] {
-            let visible = compute_visible_entries(&entries, &folded, sort_mode);
+            let visible = compute_visible_entries(&entries, &folded, sort_mode, None);
             let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
             // For each entry, verify its parent appears before it
@@ -352,7 +415,7 @@ mod tests {
         ];
 
         let folded = HashSet::new();
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
 
         // Even without parent, children should be sorted by size
         assert_eq!(visible.len(), 2);
@@ -369,7 +432,7 @@ mod tests {
         let mut folded = HashSet::new();
         folded.insert("/project/src".to_string());
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         // src should be visible but its children hidden
@@ -378,7 +441,7 @@ mod tests {
 
         // Now unfold src
         folded.remove("/project/src");
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         // src should still come before its children

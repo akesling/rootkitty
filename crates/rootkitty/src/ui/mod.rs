@@ -100,6 +100,8 @@ pub struct App {
     pending_path_exists: bool,
     /// Whether to follow symlinks during scanning
     follow_symlinks: bool,
+    /// Search query string for filtering file tree
+    search_query: String,
 }
 
 impl App {
@@ -142,6 +144,7 @@ impl App {
             pending_path_change: None,
             pending_path_exists: false,
             follow_symlinks: settings.scan.follow_symlinks,
+            search_query: String::new(),
         }
     }
 
@@ -301,8 +304,13 @@ impl App {
                         View::FileTree => match key.code {
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Esc => {
-                                // Go back to scan list
-                                self.view = View::ScanList;
+                                // If search is active, clear it; otherwise go back to scan list
+                                if !self.search_query.is_empty() {
+                                    self.search_query.clear();
+                                    self.status_message = "Search cleared".to_string();
+                                } else {
+                                    self.view = View::ScanList;
+                                }
                                 self.g_pressed = false;
                             }
                             KeyCode::Char('?') => {
@@ -407,6 +415,13 @@ impl App {
                                 // Shift+S - open settings
                                 self.previous_view = View::FileTree;
                                 self.view = View::Settings;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('/') => {
+                                // Open search dialog
+                                self.previous_view = View::FileTree;
+                                self.view = View::SearchDialog;
+                                self.search_query.clear();
                                 self.g_pressed = false;
                             }
                             _ => {
@@ -865,6 +880,33 @@ impl App {
                                 }
                             }
                         }
+                        View::SearchDialog => match key.code {
+                            KeyCode::Esc => {
+                                // Cancel search and return to file tree
+                                self.view = self.previous_view;
+                                self.search_query.clear();
+                            }
+                            KeyCode::Enter => {
+                                // Apply search and return to file tree
+                                self.view = self.previous_view;
+                                // Keep the search_query so filtering remains active
+                                if !self.search_query.is_empty() {
+                                    self.status_message =
+                                        format!("Searching for: {}", self.search_query);
+                                    // Reset file list to top when search is applied
+                                    self.file_list_state.select(Some(0));
+                                } else {
+                                    self.status_message = "Search cleared".to_string();
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                self.search_query.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                self.search_query.push(c);
+                            }
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -1135,6 +1177,7 @@ impl App {
             View::PreparingResume => self.render_preparing_resume(f, main_chunks[0]),
             View::Settings => self.render_settings(f, main_chunks[0]),
             View::ConfirmPathChange => self.render_confirm_path_change(f, main_chunks[0]),
+            View::SearchDialog => self.render_search_dialog(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -1201,9 +1244,14 @@ impl App {
 
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
         let title = if let Some(scan) = &self.current_scan {
+            let search_info = if !self.search_query.is_empty() {
+                format!(" | Search: '{}'", self.search_query)
+            } else {
+                String::new()
+            };
             format!(
-                "Files (2) | Scan: {} | z: fold/unfold | Z: unfold all | s: shell | Space: mark",
-                scan.root_path
+                "Files (2) | Scan: {}{} | /: search | z: fold | Z: unfold all | s: shell | Space: mark",
+                scan.root_path, search_info
             )
         } else {
             "Files (2)".to_string()
@@ -1339,6 +1387,27 @@ impl App {
         f.render_widget(paragraph, area);
     }
 
+    fn render_search_dialog(&self, f: &mut Frame, area: Rect) {
+        let text = vec![
+            Line::from(""),
+            Line::from("Search files by name or path:"),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                &self.search_query,
+                Style::default().fg(Color::Cyan),
+            )]),
+            Line::from(""),
+            Line::from("Press Enter to apply search, Esc to cancel"),
+            Line::from("(Case-insensitive search)"),
+        ];
+
+        let paragraph = Paragraph::new(text)
+            .block(Block::default().borders(Borders::ALL).title("Search Files"))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(paragraph, area);
+    }
+
     fn render_help(&self, f: &mut Frame, area: Rect) {
         let help_text = vec![
             Line::from(vec![Span::styled(
@@ -1379,6 +1448,7 @@ impl App {
             Line::from("  t           Toggle sort mode (size/path)"),
             Line::from("  Space       Mark/unmark file for cleanup (File view)"),
             Line::from("  Space       Remove from cleanup list (Cleanup view)"),
+            Line::from("  /           Search files by name or path (File view)"),
             Line::from("  z/o         Fold/unfold directory (File view)"),
             Line::from("  Z/O         Unfold directory and all subdirs (File view)"),
             Line::from("  s           Open shell in directory/parent (File view)"),
@@ -1810,6 +1880,9 @@ impl App {
             View::ConfirmPathChange => {
                 "y: apply change | n/Esc: keep old path"
             }
+            View::SearchDialog => {
+                "Enter: apply search | Esc: cancel | Type to search files by name or path"
+            }
         };
 
         let text = vec![
@@ -2073,7 +2146,17 @@ impl App {
     }
 
     fn get_visible_entries(&self) -> Vec<&StoredFileEntry> {
-        compute_visible_entries(&self.file_entries, &self.folded_dirs, self.file_tree_sort)
+        let search_query = if self.search_query.is_empty() {
+            None
+        } else {
+            Some(self.search_query.as_str())
+        };
+        compute_visible_entries(
+            &self.file_entries,
+            &self.folded_dirs,
+            self.file_tree_sort,
+            search_query,
+        )
     }
 
     /// Get the total size of the database on disk (including WAL files)
@@ -2778,7 +2861,7 @@ mod tests {
 
         // Initially, root and parent should be visible (parent is folded but shows up with ▶)
         // but child1, child2, and file.txt should be hidden
-        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath, None);
         assert_eq!(
             visible.len(),
             2,
@@ -2792,7 +2875,7 @@ mod tests {
         // Unfold parent - should show root, parent, child1 (folded), child2 (folded)
         // but NOT file.txt (child1 is still folded)
         folded_dirs.remove("/root/parent");
-        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath, None);
         assert_eq!(
             visible.len(),
             4,
@@ -2853,7 +2936,7 @@ mod tests {
 
         // Unfold parent
         folded_dirs.remove("/root/parent");
-        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath, None);
 
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
@@ -2908,7 +2991,7 @@ mod tests {
         ];
 
         let folded_dirs = HashSet::new(); // All unfolded for this test
-        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath, None);
 
         // All entries should be visible (sorted by path)
         assert_eq!(visible.len(), 7);
@@ -2965,7 +3048,8 @@ mod tests {
         entries_with_size[6].size = 200; // medium_file.txt
 
         let folded_dirs = HashSet::new(); // All unfolded
-        let visible = compute_visible_entries(&entries_with_size, &folded_dirs, SortMode::BySize);
+        let visible =
+            compute_visible_entries(&entries_with_size, &folded_dirs, SortMode::BySize, None);
 
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
@@ -3135,7 +3219,7 @@ mod tests {
         let entries = create_test_fixture();
         let folded = HashSet::new();
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         // All 12 entries should be visible
@@ -3161,7 +3245,7 @@ mod tests {
         let entries = create_test_fixture();
         let folded = HashSet::new();
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         // All 12 entries should be visible
@@ -3237,7 +3321,7 @@ mod tests {
         let mut folded = HashSet::new();
         folded.insert("/project/src/utils".to_string());
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::BySize, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         // Should see: project, src, main.rs, lib.rs, utils (folded), tests, integration.rs, docs, README.md, Cargo.toml
@@ -3265,7 +3349,7 @@ mod tests {
         let mut folded = HashSet::new();
         folded.insert("/project/src".to_string());
 
-        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded, SortMode::ByPath, None);
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
         // Should hide everything under /project/src
@@ -3316,7 +3400,7 @@ mod tests {
 
         // Unfold /root/a - should show a, b (folded), and file1.txt
         folded_dirs.remove("/root/a");
-        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath);
+        let visible = compute_visible_entries(&entries, &folded_dirs, SortMode::ByPath, None);
 
         let paths: Vec<&str> = visible.iter().map(|e| e.path.as_str()).collect();
 
