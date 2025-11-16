@@ -43,6 +43,7 @@ pub enum View {
 #[derive(Debug, Clone)]
 pub struct ScanProgress {
     pub entries_scanned: u64,
+    pub total_size: u64,
     pub active_dirs: Vec<(String, usize, usize)>,
     pub active_workers: usize,
 }

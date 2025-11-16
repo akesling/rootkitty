@@ -15,7 +15,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -57,6 +57,8 @@ pub struct App {
     status_message: String,
     scan_input: String,
     scan_progress: Option<ScanProgress>,
+    /// Number of previously scanned entries when resuming a scan
+    resumed_entries_count: u64,
     previous_view: View,
     /// Active scan state (if a scan is running)
     active_scan: Option<ActiveScan>,
@@ -124,6 +126,7 @@ impl App {
             status_message: String::from("Press 'n' to scan | '?' for help"),
             scan_input: String::new(),
             scan_progress: None,
+            resumed_entries_count: 0,
             previous_view: View::ScanList,
             active_scan: None,
             g_pressed: false,
@@ -344,6 +347,13 @@ impl App {
                                         if !self.search_query.is_empty() {
                                             self.search_query.clear();
                                         } else {
+                                            // Cancel any active loading task
+                                            if self.loading_task.is_some() {
+                                                self.loading_task = None;
+                                                self.loading_path = None;
+                                                self.status_message =
+                                                    "Loading cancelled".to_string();
+                                            }
                                             self.view = View::ScanList;
                                         }
                                         self.g_pressed = false;
@@ -424,6 +434,12 @@ impl App {
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Char('1') => {
+                                        // Cancel any active loading task
+                                        if self.loading_task.is_some() {
+                                            self.loading_task = None;
+                                            self.loading_path = None;
+                                            self.status_message = "Loading cancelled".to_string();
+                                        }
                                         self.view = View::ScanList;
                                         self.g_pressed = false;
                                     }
@@ -572,9 +588,36 @@ impl App {
                         View::Scanning => {
                             // During scanning, only allow cancel
                             if let KeyCode::Char('q') | KeyCode::Esc = key.code {
-                                if let Some(active_scan) = &self.active_scan {
+                                if let Some(active_scan) = self.active_scan.take() {
+                                    // Set cancellation flag
                                     active_scan.cancelled.store(true, Ordering::Relaxed);
-                                    self.status_message = "Cancelling scan...".to_string();
+
+                                    // Signal actor to shutdown
+                                    let _ = active_scan.tx.send(ActorMessage::Shutdown).await;
+                                    drop(active_scan.tx);
+
+                                    // Mark scan as paused immediately without waiting
+                                    let empty_stats = crate::scanner::ScanStats {
+                                        total_size: 0,
+                                        total_files: 0,
+                                        total_dirs: 0,
+                                    };
+                                    let _ =
+                                        self.db.pause_scan(active_scan.scan_id, &empty_stats).await;
+
+                                    // Drop the handles - this abandons the scan thread
+                                    // The OS will clean it up when the process exits
+                                    drop(active_scan.scan_handle);
+                                    drop(active_scan.actor_handle);
+
+                                    // Immediately return to scan list
+                                    self.status_message =
+                                        "Scan cancelled (background thread may still be running)"
+                                            .to_string();
+                                    self.view = View::ScanList;
+                                    self.scan_progress = None;
+                                    self.resumed_entries_count = 0;
+                                    let _ = self.load_scans().await;
                                 }
                             }
                         }
@@ -928,6 +971,7 @@ impl App {
                     Ok(progress) => {
                         self.scan_progress = Some(ScanProgress {
                             entries_scanned: progress.files_scanned,
+                            total_size: progress.total_size,
                             active_dirs: progress.active_dirs.clone(),
                             active_workers: progress.active_workers,
                         });
@@ -983,7 +1027,30 @@ impl App {
                                 }
                             }
                             Ok(Err(e)) => {
-                                self.status_message = format!("Scan error: {}", e);
+                                // Check if this was a cancellation
+                                let was_cancelled = active_scan.cancelled.load(Ordering::Relaxed);
+
+                                if was_cancelled {
+                                    // Signal actor to shutdown
+                                    let _ = active_scan.tx.send(ActorMessage::Shutdown).await;
+                                    drop(active_scan.tx);
+                                    let _ = active_scan.actor_handle.await;
+
+                                    // Mark as paused with zero stats (partial data already in DB)
+                                    let empty_stats = crate::scanner::ScanStats {
+                                        total_size: 0,
+                                        total_files: 0,
+                                        total_dirs: 0,
+                                    };
+                                    let _ =
+                                        self.db.pause_scan(active_scan.scan_id, &empty_stats).await;
+                                    self.status_message =
+                                        "Scan cancelled. Press 'r' to resume.".to_string();
+                                    let _ = self.load_scans().await;
+                                } else {
+                                    // Actual error
+                                    self.status_message = format!("Scan error: {}", e);
+                                }
                                 self.view = View::ScanList;
                                 self.scan_progress = None;
                             }
@@ -1145,6 +1212,9 @@ impl App {
                             }
                         }
                     }
+                } else {
+                    // Update throbber animation while loading
+                    self.delete_throbber_frame = (self.delete_throbber_frame + 1) % 8;
                 }
             }
         }
@@ -1258,6 +1328,44 @@ impl App {
     }
 
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
+        // Check if we're loading a scan (task active and no entries yet)
+        if self.loading_task.is_some() && self.file_entries.is_empty() {
+            // Show centered loading throbber
+            let throbber_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+            let throbber = throbber_chars[self.loading_throbber_frame % throbber_chars.len()];
+
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    format!("{} Loading scan...", throbber),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+            ];
+
+            if let Some(loading_path) = &self.loading_path {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("Path: {}", loading_path),
+                    Style::default().fg(Color::Gray),
+                )]));
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    "Loading entries from database...",
+                    Style::default().fg(Color::Gray),
+                )]));
+            }
+
+            let paragraph = Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("Files (2)"))
+                .wrap(Wrap { trim: true });
+
+            f.render_widget(paragraph, area);
+            return;
+        }
+
         let title = if let Some(scan) = &self.current_scan {
             let search_info = if !self.search_query.is_empty() {
                 format!(" | Search: '{}'", self.search_query)
@@ -1787,10 +1895,43 @@ impl App {
         ];
 
         if let Some(progress) = &self.scan_progress {
-            lines.push(Line::from(format!(
-                "Entries scanned: {}",
-                progress.entries_scanned
-            )));
+            // Show resumed entries count if this is a resumed scan
+            if self.resumed_entries_count > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("Previously scanned: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", self.resumed_entries_count),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("New entries scanned: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{}", progress.entries_scanned),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+
+            if self.resumed_entries_count > 0 {
+                lines.push(Line::from(vec![
+                    Span::styled("Total entries: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", self.resumed_entries_count + progress.entries_scanned),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
+
+            // Show total size
+            lines.push(Line::from(vec![
+                Span::styled("Total size: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format_size(progress.total_size),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]));
 
             if progress.active_workers > 0 {
                 lines.push(Line::from(format!(
@@ -2004,41 +2145,71 @@ impl App {
                 let is_folded = self.folded_dirs.contains(&dir_path);
 
                 if is_folded {
-                    // Unfold - spawn background task to load children
-                    if let Some(scan) = &self.current_scan {
-                        let scan_id = scan.id;
-                        let db = self.db.clone();
-                        let parent_path = dir_path.clone();
+                    // Check if children are already loaded (cached in file_entries)
+                    let children_already_loaded = self.file_entries.iter().any(|e| {
+                        e.path.starts_with(&format!("{}/", dir_path))
+                            || (e.path.len() > dir_path.len()
+                                && e.path.starts_with(&dir_path)
+                                && e.path.as_bytes().get(dir_path.len()) == Some(&b'/'))
+                    });
 
-                        if !recursive {
-                            // Non-recursive: load immediate children only
-                            let loading_task = tokio::spawn(async move {
-                                let children = db
-                                    .get_entries_by_parent(scan_id, Some(&parent_path))
-                                    .await?;
-                                Ok(LoadingResult::DirectoryChildren(parent_path, children))
-                            });
-
-                            self.loading_task = Some(loading_task);
-                            self.loading_path = Some(dir_path.clone());
-                            self.loading_throbber_frame = 0;
-                            self.status_message = format!("Loading: {}", dir_name);
+                    if children_already_loaded {
+                        // Children already in cache - just unfold instantly
+                        self.folded_dirs.remove(&dir_path);
+                        if recursive {
+                            // Also unfold all descendants
+                            let descendants: Vec<String> = self
+                                .file_entries
+                                .iter()
+                                .filter(|e| {
+                                    e.is_dir && e.path.starts_with(&format!("{}/", dir_path))
+                                })
+                                .map(|e| e.path.clone())
+                                .collect();
+                            for desc_path in descendants {
+                                self.folded_dirs.remove(&desc_path);
+                            }
+                            self.status_message = format!("Unfolded all in '{}'", dir_name);
                         } else {
-                            // Recursive: load all descendants
-                            let loading_task = tokio::spawn(async move {
-                                let all_descendants =
-                                    db.get_all_descendants(scan_id, &parent_path).await?;
-                                Ok(LoadingResult::RecursiveChildren(
-                                    parent_path,
-                                    all_descendants,
-                                ))
-                            });
+                            self.status_message = format!("Unfolded '{}'", dir_name);
+                        }
+                    } else {
+                        // Need to load from database
+                        if let Some(scan) = &self.current_scan {
+                            let scan_id = scan.id;
+                            let db = self.db.clone();
+                            let parent_path = dir_path.clone();
 
-                            self.loading_task = Some(loading_task);
-                            self.loading_path = Some(dir_path.clone());
-                            self.loading_throbber_frame = 0;
-                            self.status_message =
-                                format!("Loading all descendants of: {}", dir_name);
+                            if !recursive {
+                                // Non-recursive: load immediate children only
+                                let loading_task = tokio::spawn(async move {
+                                    let children = db
+                                        .get_entries_by_parent(scan_id, Some(&parent_path))
+                                        .await?;
+                                    Ok(LoadingResult::DirectoryChildren(parent_path, children))
+                                });
+
+                                self.loading_task = Some(loading_task);
+                                self.loading_path = Some(dir_path.clone());
+                                self.loading_throbber_frame = 0;
+                                self.status_message = format!("Loading: {}", dir_name);
+                            } else {
+                                // Recursive: load all descendants
+                                let loading_task = tokio::spawn(async move {
+                                    let all_descendants =
+                                        db.get_all_descendants(scan_id, &parent_path).await?;
+                                    Ok(LoadingResult::RecursiveChildren(
+                                        parent_path,
+                                        all_descendants,
+                                    ))
+                                });
+
+                                self.loading_task = Some(loading_task);
+                                self.loading_path = Some(dir_path.clone());
+                                self.loading_throbber_frame = 0;
+                                self.status_message =
+                                    format!("Loading all descendants of: {}", dir_name);
+                            }
                         }
                     }
                 } else {
@@ -2275,15 +2446,17 @@ impl App {
 
         // Switch to scanning view
         self.view = View::Scanning;
+        self.resumed_entries_count = scanned_paths.len() as u64;
         self.scan_progress = Some(ScanProgress {
             entries_scanned: 0,
+            total_size: 0,
             active_dirs: Vec::new(),
             active_workers: 0,
         });
 
         self.status_message = format!(
             "Resuming scan, skipping {} already-scanned paths...",
-            scanned_paths.len()
+            self.resumed_entries_count
         );
 
         // Create channels
@@ -2333,8 +2506,10 @@ impl App {
 
         // Switch to scanning view
         self.view = View::Scanning;
+        self.resumed_entries_count = 0; // New scan, no resumed entries
         self.scan_progress = Some(ScanProgress {
             entries_scanned: 0,
+            total_size: 0,
             active_dirs: Vec::new(),
             active_workers: 0,
         });

@@ -333,6 +333,11 @@ impl Scanner {
             }
         }
 
+        // Check if cancelled after collection phase
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Scan cancelled"));
+        }
+
         // Single-pass parallel processing: compute dir_sizes AND stats at the same time!
         let total_files = AtomicUsize::new(0);
         let total_dirs = AtomicUsize::new(0);
@@ -379,6 +384,11 @@ impl Scanner {
                 },
             )
             .0;
+
+        // Check if cancelled before constructing FileEntry objects
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Scan cancelled"));
+        }
 
         // Single-pass parallel FileEntry construction (now just one parallel op!)
         let entries: Vec<FileEntry> = all_entries
@@ -457,41 +467,236 @@ impl Scanner {
         Ok((final_entries, stats))
     }
 
+    /// Hybrid scan implementation with resume support (skips already-scanned paths)
+    fn scan_hybrid_resuming(
+        &self,
+        scanned_paths: std::collections::HashSet<String>,
+    ) -> Result<(Vec<FileEntry>, ScanStats)> {
+        use jwalk::WalkDir;
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+        // Use jwalk to traverse in PARALLEL
+        let walker = WalkDir::new(&self.root_path)
+            .follow_links(self.follow_symlinks)
+            .skip_hidden(false)
+            .into_iter()
+            .filter_map(|e| e.ok());
+
+        // Collect entries, skipping already-scanned paths
+        let mut all_entries: Vec<_> = Vec::new();
+        let mut count = 0;
+        let mut current_dir = String::new();
+
+        for entry in walker {
+            // Check if cancelled
+            if self.cancelled.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Scan cancelled"));
+            }
+
+            // Skip already-scanned paths
+            let path_str = entry.path().display().to_string();
+            if scanned_paths.contains(&path_str) {
+                continue;
+            }
+
+            // Filter out symlinks if follow_symlinks is false
+            if !self.follow_symlinks && entry.file_type().is_symlink() {
+                continue;
+            }
+
+            // Track current directory being scanned
+            if entry.file_type().is_dir() {
+                current_dir = entry.path().display().to_string();
+            }
+
+            all_entries.push(entry);
+
+            // Send progress updates periodically
+            count += 1;
+            if let Some(progress_tx) = &self.progress_sender {
+                if count % PROGRESS_UPDATE_INTERVAL == 0 {
+                    let _ = progress_tx.send(ProgressUpdate {
+                        files_scanned: count,
+                        dirs_scanned: 0,
+                        total_size: 0,
+                        current_path: current_dir.clone(),
+                        active_dirs: vec![],
+                        active_workers: 1,
+                    });
+                }
+            }
+        }
+
+        // Check if cancelled after collection phase
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Scan cancelled"));
+        }
+
+        // Single-pass parallel processing
+        let total_files = AtomicUsize::new(0);
+        let total_dirs = AtomicUsize::new(0);
+        let total_size = AtomicU64::new(0);
+
+        let dir_sizes: HashMap<PathBuf, u64> = all_entries
+            .par_iter()
+            .fold(
+                || (HashMap::new(), 0, 0, 0u64),
+                |(mut map, mut files, mut dirs, mut size), entry| {
+                    let is_dir = entry.file_type().is_dir();
+
+                    if is_dir {
+                        dirs += 1;
+                    } else {
+                        files += 1;
+                        let file_size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                        size += file_size;
+
+                        let path = entry.path();
+                        let mut current = path.parent();
+                        while let Some(parent) = current {
+                            *map.entry(parent.to_path_buf()).or_insert(0) += file_size;
+                            current = parent.parent();
+                        }
+                    }
+                    (map, files, dirs, size)
+                },
+            )
+            .reduce(
+                || (HashMap::new(), 0, 0, 0u64),
+                |(mut map_a, files_a, dirs_a, size_a), (map_b, files_b, dirs_b, size_b)| {
+                    for (path, size) in map_b {
+                        *map_a.entry(path).or_insert(0) += size;
+                    }
+                    total_files.fetch_add(files_a + files_b, Ordering::Relaxed);
+                    total_dirs.fetch_add(dirs_a + dirs_b, Ordering::Relaxed);
+                    total_size.fetch_add(size_a + size_b, Ordering::Relaxed);
+                    (map_a, 0, 0, 0)
+                },
+            )
+            .0;
+
+        // Check if cancelled before constructing FileEntry objects
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Scan cancelled"));
+        }
+
+        // Construct FileEntry objects (same as regular scan_hybrid)
+        let entries: Vec<FileEntry> = all_entries
+            .par_iter()
+            .map(|entry| {
+                let path = entry.path().to_path_buf();
+                let metadata = entry.metadata().ok();
+                let is_dir = entry.file_type().is_dir();
+
+                let name = if path == self.root_path {
+                    self.root_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("/")
+                        .to_string()
+                } else {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+
+                let parent_path = path.parent().map(|p| p.to_path_buf());
+                let modified_at = metadata.as_ref().and_then(|m| {
+                    m.modified().ok().map(|t| {
+                        let system_time: std::time::SystemTime = t;
+                        DateTime::<Utc>::from(system_time)
+                    })
+                });
+
+                let file_size = if is_dir {
+                    0
+                } else {
+                    metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+                };
+
+                let size = if is_dir {
+                    *dir_sizes.get(&path).unwrap_or(&0)
+                } else {
+                    file_size
+                };
+
+                FileEntry {
+                    path,
+                    name,
+                    parent_path,
+                    size,
+                    is_dir,
+                    modified_at,
+                    depth: entry.depth(),
+                }
+            })
+            .collect();
+
+        let stats = ScanStats {
+            total_size: total_size.load(Ordering::Relaxed),
+            total_files: total_files.load(Ordering::Relaxed) as u64,
+            total_dirs: total_dirs.load(Ordering::Relaxed) as u64,
+        };
+
+        // Stream entries to database
+        for entry in &entries {
+            self.add_entry(entry.clone());
+        }
+        self.flush_buffer()?;
+
+        let final_entries = if self.sender.is_some() {
+            Vec::new()
+        } else {
+            entries
+        };
+
+        Ok((final_entries, stats))
+    }
+
     /// Resume a scan that was previously paused, skipping already-scanned paths
     /// The `scanned_paths` HashSet contains paths that have already been scanned
     pub fn scan_resuming(
         &self,
         scanned_paths: std::collections::HashSet<String>,
     ) -> Result<(Vec<FileEntry>, ScanStats)> {
-        let total_size = AtomicU64::new(0);
-        let total_files = AtomicU64::new(0);
-        let total_dirs = AtomicU64::new(0);
+        // Dispatch based on implementation (prefer hybrid for performance)
+        match self.implementation {
+            ScannerImpl::Hybrid => self.scan_hybrid_resuming(scanned_paths),
+            ScannerImpl::Custom | ScannerImpl::Walkdir => {
+                // Fall back to recursive implementation
+                let total_size = AtomicU64::new(0);
+                let total_files = AtomicU64::new(0);
+                let total_dirs = AtomicU64::new(0);
 
-        self.scan_recursive_resuming(
-            &self.root_path,
-            0,
-            &total_size,
-            &total_files,
-            &total_dirs,
-            &scanned_paths,
-        )?;
+                self.scan_recursive_resuming(
+                    &self.root_path,
+                    0,
+                    &total_size,
+                    &total_files,
+                    &total_dirs,
+                    &scanned_paths,
+                )?;
 
-        // Final flush of any remaining buffered entries
-        self.flush_buffer()?;
+                // Final flush of any remaining buffered entries
+                self.flush_buffer()?;
 
-        let entries = if self.sender.is_some() {
-            Vec::new()
-        } else {
-            self.entries.lock().unwrap().clone()
-        };
+                let entries = if self.sender.is_some() {
+                    Vec::new()
+                } else {
+                    self.entries.lock().unwrap().clone()
+                };
 
-        let stats = ScanStats {
-            total_size: total_size.load(Ordering::Relaxed),
-            total_files: total_files.load(Ordering::Relaxed),
-            total_dirs: total_dirs.load(Ordering::Relaxed),
-        };
+                let stats = ScanStats {
+                    total_size: total_size.load(Ordering::Relaxed),
+                    total_files: total_files.load(Ordering::Relaxed),
+                    total_dirs: total_dirs.load(Ordering::Relaxed),
+                };
 
-        Ok((entries, stats))
+                Ok((entries, stats))
+            }
+        }
     }
 
     fn flush_buffer(&self) -> Result<()> {
