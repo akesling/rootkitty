@@ -51,7 +51,8 @@ async fn create_test_db() -> Database {
             total_size INTEGER NOT NULL DEFAULT 0,
             total_files INTEGER NOT NULL DEFAULT 0,
             total_dirs INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed'))
+            status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed')),
+            entries_table TEXT
         );
         CREATE INDEX idx_scans_started_at ON scans(started_at DESC);
         CREATE INDEX idx_scans_root_path ON scans(root_path);
@@ -76,12 +77,11 @@ async fn create_test_db() -> Database {
         CREATE TABLE IF NOT EXISTS cleanup_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scan_id INTEGER NOT NULL,
-            file_entry_id INTEGER NOT NULL,
+            entry_path TEXT NOT NULL,
             marked_at TEXT NOT NULL,
             reason TEXT,
             FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE,
-            FOREIGN KEY (file_entry_id) REFERENCES file_entries(id) ON DELETE CASCADE,
-            UNIQUE(scan_id, file_entry_id)
+            UNIQUE(scan_id, entry_path)
         );
         CREATE INDEX idx_cleanup_items_scan_id ON cleanup_items(scan_id);
         "#,
@@ -257,10 +257,10 @@ async fn test_cleanup_workflow() {
     assert!(entries.len() >= 2);
 
     // Mark first two entries for cleanup
-    db.mark_for_cleanup(scan_id, entries[0].id, Some("Too large"))
+    db.mark_for_cleanup(scan_id, &entries[0].path, Some("Too large"))
         .await
         .unwrap();
-    db.mark_for_cleanup(scan_id, entries[1].id, Some("Old file"))
+    db.mark_for_cleanup(scan_id, &entries[1].path, Some("Old file"))
         .await
         .unwrap();
 
@@ -272,13 +272,13 @@ async fn test_cleanup_workflow() {
     assert!(cleanup[0].size >= cleanup[1].size);
 
     // Remove one from cleanup
-    db.remove_cleanup_item(scan_id, entries[0].id)
+    db.remove_cleanup_item(scan_id, &entries[0].path)
         .await
         .unwrap();
 
     let cleanup = db.get_cleanup_items(scan_id).await.unwrap();
     assert_eq!(cleanup.len(), 1);
-    assert_eq!(cleanup[0].id, entries[1].id);
+    assert_eq!(cleanup[0].path, entries[1].path);
 }
 
 #[tokio::test]

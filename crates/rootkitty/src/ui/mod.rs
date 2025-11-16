@@ -2373,7 +2373,7 @@ impl App {
             if let Some(selected) = self.file_list_state.selected() {
                 let visible_entries = self.get_visible_entries();
                 if let Some(entry) = visible_entries.get(selected) {
-                    self.db.mark_for_cleanup(scan.id, entry.id, None).await?;
+                    self.db.mark_for_cleanup(scan.id, &entry.path, None).await?;
                     self.status_message = format!("Marked '{}' for cleanup", entry.name);
                 }
             }
@@ -2396,10 +2396,10 @@ impl App {
         if let Some(scan) = &self.current_scan {
             if let Some(selected) = self.cleanup_list_state.selected() {
                 if let Some(entry) = self.cleanup_items.get(selected) {
-                    let entry_id = entry.id;
+                    let entry_path = entry.path.clone();
                     let entry_name = entry.name.clone();
 
-                    self.db.remove_cleanup_item(scan.id, entry_id).await?;
+                    self.db.remove_cleanup_item(scan.id, &entry_path).await?;
                     self.load_cleanup_items().await?;
                     self.status_message = format!("Removed '{}' from cleanup", entry_name);
 

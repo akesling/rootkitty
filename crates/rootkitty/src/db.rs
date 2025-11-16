@@ -55,6 +55,7 @@ pub struct Scan {
     pub total_files: i64,
     pub total_dirs: i64,
     pub status: String,
+    pub entries_table: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,41 @@ impl Database {
     #[allow(dead_code)]
     pub fn from_pool(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Get the table name for entries of a given scan
+    /// Returns scan-specific table for new scans, or "file_entries" for legacy scans
+    async fn get_entries_table(&self, scan_id: i64) -> Result<String> {
+        let scan =
+            sqlx::query_as::<_, (Option<String>,)>("SELECT entries_table FROM scans WHERE id = ?")
+                .bind(scan_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+        Ok(scan.0.unwrap_or_else(|| "file_entries".to_string()))
+    }
+
+    /// Helper to parse a row into StoredFileEntry
+    /// Note: scan_id field is populated with the parameter value since per-scan tables don't store it
+    fn row_to_entry(row: &sqlx::sqlite::SqliteRow, scan_id: i64) -> StoredFileEntry {
+        use sqlx::Row;
+        let modified_at_str: Option<String> = row.get("modified_at");
+
+        StoredFileEntry {
+            id: row.get("id"),
+            scan_id,
+            path: row.get("path"),
+            name: row.get("name"),
+            parent_path: row.get("parent_path"),
+            size: row.get("size"),
+            is_dir: row.get("is_dir"),
+            modified_at: modified_at_str.and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
+            depth: row.get("depth"),
+        }
     }
 
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
@@ -121,6 +157,7 @@ impl Database {
         let root_path_str = canonical_path.display().to_string();
         let started_at = Utc::now().to_rfc3339();
 
+        // Insert scan record first to get the ID
         let result = sqlx::query(
             "INSERT INTO scans (root_path, started_at, status) VALUES (?, ?, 'running')",
         )
@@ -129,7 +166,53 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        Ok(result.last_insert_rowid())
+        let scan_id = result.last_insert_rowid();
+        let table_name = format!("scan_entries_{}", scan_id);
+
+        // Create per-scan entries table
+        let create_table_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                parent_path TEXT,
+                size INTEGER NOT NULL,
+                is_dir INTEGER NOT NULL,
+                modified_at TEXT,
+                depth INTEGER NOT NULL
+            )",
+            table_name
+        );
+        sqlx::query(&create_table_sql).execute(&self.pool).await?;
+
+        // Create indices for the new table
+        let create_indices_sql = vec![
+            format!(
+                "CREATE INDEX idx_{}_path ON {}(path)",
+                table_name, table_name
+            ),
+            format!(
+                "CREATE INDEX idx_{}_parent ON {}(parent_path)",
+                table_name, table_name
+            ),
+            format!(
+                "CREATE INDEX idx_{}_size ON {}(size DESC)",
+                table_name, table_name
+            ),
+        ];
+
+        for index_sql in create_indices_sql {
+            sqlx::query(&index_sql).execute(&self.pool).await?;
+        }
+
+        // Update scan record with table name
+        sqlx::query("UPDATE scans SET entries_table = ? WHERE id = ?")
+            .bind(&table_name)
+            .bind(scan_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(scan_id)
     }
 
     pub async fn complete_scan(&self, scan_id: i64, stats: &ScanStats) -> Result<()> {
@@ -166,17 +249,17 @@ impl Database {
     /// Calculate scan statistics from file_entries in the database
     /// Useful for recovering stats from interrupted scans
     pub async fn calculate_scan_stats(&self, scan_id: i64) -> Result<ScanStats> {
-        let row = sqlx::query(
+        let table_name = self.get_entries_table(scan_id).await?;
+        let query_str = format!(
             "SELECT
                 COALESCE(SUM(size), 0) as total_size,
                 COALESCE(SUM(CASE WHEN is_dir = 0 THEN 1 ELSE 0 END), 0) as total_files,
                 COALESCE(SUM(CASE WHEN is_dir = 1 THEN 1 ELSE 0 END), 0) as total_dirs
-             FROM file_entries
-             WHERE scan_id = ?",
-        )
-        .bind(scan_id)
-        .fetch_one(&self.pool)
-        .await?;
+             FROM {}",
+            table_name
+        );
+
+        let row = sqlx::query(&query_str).fetch_one(&self.pool).await?;
 
         Ok(ScanStats {
             total_size: row.get::<i64, _>("total_size") as u64,
@@ -191,10 +274,10 @@ impl Database {
         &self,
         scan_id: i64,
     ) -> Result<std::collections::HashSet<String>> {
-        let rows = sqlx::query("SELECT path FROM file_entries WHERE scan_id = ?")
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?;
+        let table_name = self.get_entries_table(scan_id).await?;
+        let query_str = format!("SELECT path FROM {}", table_name);
+
+        let rows = sqlx::query(&query_str).fetch_all(&self.pool).await?;
 
         let paths = rows
             .iter()
@@ -205,11 +288,20 @@ impl Database {
     }
 
     pub async fn delete_scan(&self, scan_id: i64) -> Result<()> {
-        // Delete file entries first (due to foreign key constraint)
-        sqlx::query("DELETE FROM file_entries WHERE scan_id = ?")
-            .bind(scan_id)
-            .execute(&self.pool)
-            .await?;
+        // Get the entries table name before deleting scan record
+        let table_name = self.get_entries_table(scan_id).await?;
+
+        // Drop the per-scan entries table (simple garbage collection!)
+        if table_name != "file_entries" {
+            let drop_query = format!("DROP TABLE IF EXISTS {}", table_name);
+            sqlx::query(&drop_query).execute(&self.pool).await?;
+        } else {
+            // Legacy fallback: delete from shared table
+            sqlx::query("DELETE FROM file_entries WHERE scan_id = ?")
+                .bind(scan_id)
+                .execute(&self.pool)
+                .await?;
+        }
 
         // Delete cleanup items
         sqlx::query("DELETE FROM cleanup_items WHERE scan_id = ?")
@@ -228,17 +320,19 @@ impl Database {
 
     #[allow(dead_code)]
     pub async fn is_path_scanned(&self, scan_id: i64, path: &str) -> Result<bool> {
-        let result =
-            sqlx::query("SELECT 1 FROM file_entries WHERE scan_id = ? AND path = ? LIMIT 1")
-                .bind(scan_id)
-                .bind(path)
-                .fetch_optional(&self.pool)
-                .await?;
+        let table_name = self.get_entries_table(scan_id).await?;
+        let query_str = format!("SELECT 1 FROM {} WHERE path = ? LIMIT 1", table_name);
+
+        let result = sqlx::query(&query_str)
+            .bind(path)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(result.is_some())
     }
 
     pub async fn insert_file_entries(&self, scan_id: i64, entries: &[FileEntry]) -> Result<()> {
+        let table_name = self.get_entries_table(scan_id).await?;
         let mut tx = self.pool.begin().await?;
 
         for entry in entries {
@@ -246,20 +340,22 @@ impl Database {
             let parent_str = entry.parent_path.as_ref().map(|p| p.display().to_string());
             let modified_str = entry.modified_at.map(|dt| dt.to_rfc3339());
 
-            sqlx::query(
-                "INSERT INTO file_entries (scan_id, path, name, parent_path, size, is_dir, modified_at, depth)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-            .bind(scan_id)
-            .bind(&path_str)
-            .bind(&entry.name)
-            .bind(&parent_str)
-            .bind(entry.size as i64)
-            .bind(entry.is_dir)
-            .bind(&modified_str)
-            .bind(entry.depth as i64)
-            .execute(&mut *tx)
-            .await?;
+            let query_str = format!(
+                "INSERT INTO {} (path, name, parent_path, size, is_dir, modified_at, depth)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                table_name
+            );
+
+            sqlx::query(&query_str)
+                .bind(&path_str)
+                .bind(&entry.name)
+                .bind(&parent_str)
+                .bind(entry.size as i64)
+                .bind(entry.is_dir)
+                .bind(&modified_str)
+                .bind(entry.depth as i64)
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
@@ -268,7 +364,7 @@ impl Database {
 
     pub async fn list_scans(&self) -> Result<Vec<Scan>> {
         let rows = sqlx::query(
-            "SELECT id, root_path, started_at, completed_at, total_size, total_files, total_dirs, status
+            "SELECT id, root_path, started_at, completed_at, total_size, total_files, total_dirs, status, entries_table
              FROM scans ORDER BY started_at DESC"
         )
         .fetch_all(&self.pool)
@@ -295,6 +391,7 @@ impl Database {
                     total_files: row.get("total_files"),
                     total_dirs: row.get("total_dirs"),
                     status: row.get("status"),
+                    entries_table: row.get("entries_table"),
                 }
             })
             .collect();
@@ -304,7 +401,7 @@ impl Database {
 
     pub async fn get_scan(&self, scan_id: i64) -> Result<Option<Scan>> {
         let row = sqlx::query(
-            "SELECT id, root_path, started_at, completed_at, total_size, total_files, total_dirs, status
+            "SELECT id, root_path, started_at, completed_at, total_size, total_files, total_dirs, status, entries_table
              FROM scans WHERE id = ?"
         )
         .bind(scan_id)
@@ -330,6 +427,7 @@ impl Database {
                 total_files: row.get("total_files"),
                 total_dirs: row.get("total_dirs"),
                 status: row.get("status"),
+                entries_table: row.get("entries_table"),
             }
         });
 
@@ -341,70 +439,37 @@ impl Database {
         scan_id: i64,
         limit: i64,
     ) -> Result<Vec<StoredFileEntry>> {
-        let rows = sqlx::query(
-            "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
-             FROM file_entries WHERE scan_id = ? ORDER BY size DESC LIMIT ?",
-        )
-        .bind(scan_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let table_name = self.get_entries_table(scan_id).await?;
+        let query_str = format!(
+            "SELECT id, path, name, parent_path, size, is_dir, modified_at, depth
+             FROM {} ORDER BY size DESC LIMIT ?",
+            table_name
+        );
+
+        let rows = sqlx::query(&query_str)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
         let entries = rows
             .iter()
-            .map(|row| {
-                let modified_at_str: Option<String> = row.get("modified_at");
-
-                StoredFileEntry {
-                    id: row.get("id"),
-                    scan_id: row.get("scan_id"),
-                    path: row.get("path"),
-                    name: row.get("name"),
-                    parent_path: row.get("parent_path"),
-                    size: row.get("size"),
-                    is_dir: row.get("is_dir"),
-                    modified_at: modified_at_str.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    depth: row.get("depth"),
-                }
-            })
+            .map(|row| Self::row_to_entry(row, scan_id))
             .collect();
 
         Ok(entries)
     }
 
     pub async fn get_root_entry(&self, scan_id: i64) -> Result<Option<StoredFileEntry>> {
-        let row = sqlx::query(
-            "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
-             FROM file_entries WHERE scan_id = ? AND depth = 0 LIMIT 1",
-        )
-        .bind(scan_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let table_name = self.get_entries_table(scan_id).await?;
+        let query_str = format!(
+            "SELECT id, path, name, parent_path, size, is_dir, modified_at, depth
+             FROM {} WHERE depth = 0 LIMIT 1",
+            table_name
+        );
 
-        if let Some(row) = row {
-            let modified_at_str: Option<String> = row.get("modified_at");
-            Ok(Some(StoredFileEntry {
-                id: row.get("id"),
-                scan_id: row.get("scan_id"),
-                path: row.get("path"),
-                name: row.get("name"),
-                parent_path: row.get("parent_path"),
-                size: row.get("size"),
-                is_dir: row.get("is_dir"),
-                modified_at: modified_at_str.and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                }),
-                depth: row.get("depth"),
-            }))
-        } else {
-            Ok(None)
-        }
+        let row = sqlx::query(&query_str).fetch_optional(&self.pool).await?;
+
+        Ok(row.as_ref().map(|r| Self::row_to_entry(r, scan_id)))
     }
 
     pub async fn get_entries_by_parent(
@@ -412,46 +477,30 @@ impl Database {
         scan_id: i64,
         parent_path: Option<&str>,
     ) -> Result<Vec<StoredFileEntry>> {
+        let table_name = self.get_entries_table(scan_id).await?;
+
         let rows = if let Some(parent) = parent_path {
-            sqlx::query(
-                "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
-                 FROM file_entries WHERE scan_id = ? AND parent_path = ? ORDER BY size DESC",
-            )
-            .bind(scan_id)
-            .bind(parent)
-            .fetch_all(&self.pool)
-            .await?
+            let query_str = format!(
+                "SELECT id, path, name, parent_path, size, is_dir, modified_at, depth
+                 FROM {} WHERE parent_path = ? ORDER BY size DESC",
+                table_name
+            );
+            sqlx::query(&query_str)
+                .bind(parent)
+                .fetch_all(&self.pool)
+                .await?
         } else {
-            sqlx::query(
-                "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
-                 FROM file_entries WHERE scan_id = ? AND parent_path IS NULL ORDER BY size DESC",
-            )
-            .bind(scan_id)
-            .fetch_all(&self.pool)
-            .await?
+            let query_str = format!(
+                "SELECT id, path, name, parent_path, size, is_dir, modified_at, depth
+                 FROM {} WHERE parent_path IS NULL ORDER BY size DESC",
+                table_name
+            );
+            sqlx::query(&query_str).fetch_all(&self.pool).await?
         };
 
         let entries = rows
             .iter()
-            .map(|row| {
-                let modified_at_str: Option<String> = row.get("modified_at");
-
-                StoredFileEntry {
-                    id: row.get("id"),
-                    scan_id: row.get("scan_id"),
-                    path: row.get("path"),
-                    name: row.get("name"),
-                    parent_path: row.get("parent_path"),
-                    size: row.get("size"),
-                    is_dir: row.get("is_dir"),
-                    modified_at: modified_at_str.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    depth: row.get("depth"),
-                }
-            })
+            .map(|row| Self::row_to_entry(row, scan_id))
             .collect();
 
         Ok(entries)
@@ -463,43 +512,28 @@ impl Database {
         scan_id: i64,
         parent_path: &str,
     ) -> Result<Vec<StoredFileEntry>> {
+        let table_name = self.get_entries_table(scan_id).await?;
         // Use path prefix matching to get all descendants
         // We match paths that start with "parent_path/"
         let prefix_pattern = format!("{}/%", parent_path);
 
-        let rows = sqlx::query(
-            "SELECT id, scan_id, path, name, parent_path, size, is_dir, modified_at, depth
-             FROM file_entries
-             WHERE scan_id = ? AND (path LIKE ? OR parent_path = ?)
+        let query_str = format!(
+            "SELECT id, path, name, parent_path, size, is_dir, modified_at, depth
+             FROM {}
+             WHERE path LIKE ? OR parent_path = ?
              ORDER BY path",
-        )
-        .bind(scan_id)
-        .bind(&prefix_pattern)
-        .bind(parent_path)
-        .fetch_all(&self.pool)
-        .await?;
+            table_name
+        );
+
+        let rows = sqlx::query(&query_str)
+            .bind(&prefix_pattern)
+            .bind(parent_path)
+            .fetch_all(&self.pool)
+            .await?;
 
         let entries = rows
             .iter()
-            .map(|row| {
-                let modified_at_str: Option<String> = row.get("modified_at");
-
-                StoredFileEntry {
-                    id: row.get("id"),
-                    scan_id: row.get("scan_id"),
-                    path: row.get("path"),
-                    name: row.get("name"),
-                    parent_path: row.get("parent_path"),
-                    size: row.get("size"),
-                    is_dir: row.get("is_dir"),
-                    modified_at: modified_at_str.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    depth: row.get("depth"),
-                }
-            })
+            .map(|row| Self::row_to_entry(row, scan_id))
             .collect();
 
         Ok(entries)
@@ -508,16 +542,16 @@ impl Database {
     pub async fn mark_for_cleanup(
         &self,
         scan_id: i64,
-        file_entry_id: i64,
+        entry_path: &str,
         reason: Option<&str>,
     ) -> Result<()> {
         let marked_at = Utc::now().to_rfc3339();
 
         sqlx::query(
-            "INSERT OR IGNORE INTO cleanup_items (scan_id, file_entry_id, marked_at, reason) VALUES (?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO cleanup_items (scan_id, entry_path, marked_at, reason) VALUES (?, ?, ?, ?)"
         )
         .bind(scan_id)
-        .bind(file_entry_id)
+        .bind(entry_path)
         .bind(&marked_at)
         .bind(reason)
         .execute(&self.pool)
@@ -527,47 +561,52 @@ impl Database {
     }
 
     pub async fn get_cleanup_items(&self, scan_id: i64) -> Result<Vec<StoredFileEntry>> {
-        let rows = sqlx::query(
-            "SELECT fe.id, fe.scan_id, fe.path, fe.name, fe.parent_path, fe.size, fe.is_dir, fe.modified_at, fe.depth
-             FROM file_entries fe
-             INNER JOIN cleanup_items ci ON fe.id = ci.file_entry_id
-             WHERE ci.scan_id = ?
-             ORDER BY fe.size DESC"
-        )
-        .bind(scan_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let table_name = self.get_entries_table(scan_id).await?;
+
+        // Get cleanup paths
+        let cleanup_paths: Vec<String> =
+            sqlx::query_scalar("SELECT entry_path FROM cleanup_items WHERE scan_id = ?")
+                .bind(scan_id)
+                .fetch_all(&self.pool)
+                .await?;
+
+        if cleanup_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Build query to get entries for those paths
+        let placeholders = cleanup_paths
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let query_str = format!(
+            "SELECT id, path, name, parent_path, size, is_dir, modified_at, depth
+             FROM {}
+             WHERE path IN ({})
+             ORDER BY size DESC",
+            table_name, placeholders
+        );
+
+        let mut query = sqlx::query(&query_str);
+        for path in &cleanup_paths {
+            query = query.bind(path);
+        }
+
+        let rows = query.fetch_all(&self.pool).await?;
 
         let entries = rows
             .iter()
-            .map(|row| {
-                let modified_at_str: Option<String> = row.get("modified_at");
-
-                StoredFileEntry {
-                    id: row.get("id"),
-                    scan_id: row.get("scan_id"),
-                    path: row.get("path"),
-                    name: row.get("name"),
-                    parent_path: row.get("parent_path"),
-                    size: row.get("size"),
-                    is_dir: row.get("is_dir"),
-                    modified_at: modified_at_str.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                    depth: row.get("depth"),
-                }
-            })
+            .map(|row| Self::row_to_entry(row, scan_id))
             .collect();
 
         Ok(entries)
     }
 
-    pub async fn remove_cleanup_item(&self, scan_id: i64, file_entry_id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM cleanup_items WHERE scan_id = ? AND file_entry_id = ?")
+    pub async fn remove_cleanup_item(&self, scan_id: i64, entry_path: &str) -> Result<()> {
+        sqlx::query("DELETE FROM cleanup_items WHERE scan_id = ? AND entry_path = ?")
             .bind(scan_id)
-            .bind(file_entry_id)
+            .bind(entry_path)
             .execute(&self.pool)
             .await?;
 
@@ -603,7 +642,8 @@ mod tests {
                 total_size INTEGER NOT NULL DEFAULT 0,
                 total_files INTEGER NOT NULL DEFAULT 0,
                 total_dirs INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'paused'))
+                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running', 'completed', 'failed', 'paused')),
+                entries_table TEXT
             );
             CREATE INDEX idx_scans_started_at ON scans(started_at DESC);
             CREATE INDEX idx_scans_root_path ON scans(root_path);
@@ -628,12 +668,11 @@ mod tests {
             CREATE TABLE IF NOT EXISTS cleanup_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scan_id INTEGER NOT NULL,
-                file_entry_id INTEGER NOT NULL,
+                entry_path TEXT NOT NULL,
                 marked_at TEXT NOT NULL,
                 reason TEXT,
                 FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE CASCADE,
-                FOREIGN KEY (file_entry_id) REFERENCES file_entries(id) ON DELETE CASCADE,
-                UNIQUE(scan_id, file_entry_id)
+                UNIQUE(scan_id, entry_path)
             );
             CREATE INDEX idx_cleanup_items_scan_id ON cleanup_items(scan_id);
             "#,
@@ -748,27 +787,29 @@ mod tests {
 
         db.insert_file_entries(scan_id, &entries).await.unwrap();
 
-        // Get entry IDs
+        // Get entry paths
         let stored_entries = db.get_largest_entries(scan_id, 10).await.unwrap();
-        let entry1_id = stored_entries[1].id; // Smaller file
-        let entry2_id = stored_entries[0].id; // Larger file
+        let entry1_path = stored_entries[1].path.clone(); // Smaller file
+        let entry2_path = stored_entries[0].path.clone(); // Larger file
 
         // Mark for cleanup
-        db.mark_for_cleanup(scan_id, entry1_id, Some("test reason"))
+        db.mark_for_cleanup(scan_id, &entry1_path, Some("test reason"))
             .await
             .unwrap();
-        db.mark_for_cleanup(scan_id, entry2_id, None).await.unwrap();
+        db.mark_for_cleanup(scan_id, &entry2_path, None)
+            .await
+            .unwrap();
 
         // Retrieve cleanup items
         let cleanup_items = db.get_cleanup_items(scan_id).await.unwrap();
         assert_eq!(cleanup_items.len(), 2);
 
         // Remove one cleanup item
-        db.remove_cleanup_item(scan_id, entry1_id).await.unwrap();
+        db.remove_cleanup_item(scan_id, &entry1_path).await.unwrap();
 
         let cleanup_items = db.get_cleanup_items(scan_id).await.unwrap();
         assert_eq!(cleanup_items.len(), 1);
-        assert_eq!(cleanup_items[0].id, entry2_id);
+        assert_eq!(cleanup_items[0].path, entry2_path);
     }
 
     #[tokio::test]

@@ -9,5 +9,3 @@
 * For garbage collection simplicity, etc. each scan should be its own table and
   there should be a scans table that stores metadata about each scan, including
   the table in which it is stored
-* While a scan is loading, we should show some form of throbber in the middle of
-  the screen

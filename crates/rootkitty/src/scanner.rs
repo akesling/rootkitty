@@ -296,6 +296,7 @@ impl Scanner {
         let mut all_entries: Vec<_> = Vec::new();
         let mut count = 0;
         let mut current_dir = String::new();
+        let mut running_size = 0u64;
 
         for entry in walker {
             // Check if cancelled
@@ -313,6 +314,13 @@ impl Scanner {
                 current_dir = entry.path().display().to_string();
             }
 
+            // Track size for files
+            if !entry.file_type().is_dir() {
+                if let Ok(metadata) = entry.metadata() {
+                    running_size += metadata.len();
+                }
+            }
+
             all_entries.push(entry);
 
             // Send progress updates periodically during collection
@@ -324,7 +332,7 @@ impl Scanner {
                     let _ = progress_tx.send(ProgressUpdate {
                         files_scanned: count,
                         dirs_scanned: 0,
-                        total_size: 0,
+                        total_size: running_size,
                         current_path: current_dir.clone(),
                         active_dirs: vec![], // No per-directory progress for hybrid
                         active_workers: 1,   // jwalk uses internal parallelism
@@ -487,6 +495,7 @@ impl Scanner {
         let mut all_entries: Vec<_> = Vec::new();
         let mut count = 0;
         let mut current_dir = String::new();
+        let mut running_size = 0u64;
 
         for entry in walker {
             // Check if cancelled
@@ -510,6 +519,13 @@ impl Scanner {
                 current_dir = entry.path().display().to_string();
             }
 
+            // Track size for files
+            if !entry.file_type().is_dir() {
+                if let Ok(metadata) = entry.metadata() {
+                    running_size += metadata.len();
+                }
+            }
+
             all_entries.push(entry);
 
             // Send progress updates periodically
@@ -519,7 +535,7 @@ impl Scanner {
                     let _ = progress_tx.send(ProgressUpdate {
                         files_scanned: count,
                         dirs_scanned: 0,
-                        total_size: 0,
+                        total_size: running_size,
                         current_path: current_dir.clone(),
                         active_dirs: vec![],
                         active_workers: 1,
