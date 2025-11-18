@@ -351,10 +351,30 @@ impl Scanner {
         let total_dirs = AtomicUsize::new(0);
         let total_size = AtomicU64::new(0);
 
-        let dir_sizes: HashMap<PathBuf, u64> = all_entries
+        // First pass: build inode -> (size, first_path) map to detect hard links
+        #[cfg(unix)]
+        let inode_map: HashMap<u64, (u64, PathBuf)> = {
+            use std::os::unix::fs::MetadataExt;
+            let mut map = HashMap::new();
+            for entry in &all_entries {
+                if !entry.file_type().is_dir() {
+                    if let Ok(metadata) = entry.metadata() {
+                        let inode = metadata.ino();
+                        let size = metadata.len();
+                        // Canonicalize path to handle symlinks like /tmp -> /private/tmp
+                        let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path().to_path_buf());
+                        // Only store first occurrence of each inode
+                        map.entry(inode).or_insert((size, path));
+                    }
+                }
+            }
+            map
+        };
+
+        let (dir_sizes, final_files, final_dirs, final_size) = all_entries
             .par_iter()
             .fold(
-                || (HashMap::new(), 0, 0, 0u64), // (map, files, dirs, size)
+                || (HashMap::new(), 0, 0, 0u64), // (dir_map, files, dirs, size)
                 |(mut map, mut files, mut dirs, mut size), entry| {
                     let is_dir = entry.file_type().is_dir();
 
@@ -363,15 +383,44 @@ impl Scanner {
                         dirs += 1;
                     } else {
                         files += 1;
-                        let file_size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                        size += file_size;
 
-                        // Calculate dir contributions for this file
-                        let path = entry.path();
-                        let mut current = path.parent();
-                        while let Some(parent) = current {
-                            *map.entry(parent.to_path_buf()).or_insert(0) += file_size;
-                            current = parent.parent();
+                        // Check if this is the first occurrence of this inode (Unix only)
+                        #[cfg(unix)]
+                        let (file_size, is_first_occurrence) = {
+                            use std::os::unix::fs::MetadataExt;
+                            if let Ok(metadata) = entry.metadata() {
+                                let inode = metadata.ino();
+                                // Canonicalize path to handle symlinks like /tmp -> /private/tmp
+                                let current_path = entry.path().canonicalize()
+                                    .unwrap_or_else(|_| entry.path().to_path_buf());
+                                // This is the first occurrence if the stored path matches current path
+                                let is_first = inode_map.get(&inode)
+                                    .map(|(_, first_path)| first_path == &current_path)
+                                    .unwrap_or(true);
+                                (metadata.len(), is_first)
+                            } else {
+                                (0, true)
+                            }
+                        };
+
+                        // On non-Unix, always count the file
+                        #[cfg(not(unix))]
+                        let (file_size, is_first_occurrence) = {
+                            let sz = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                            (sz, true)
+                        };
+
+                        // Only add to size totals if this is the first occurrence of this inode
+                        if is_first_occurrence {
+                            size += file_size;
+
+                            // Calculate dir contributions for this file
+                            let path = entry.path();
+                            let mut current = path.parent();
+                            while let Some(parent) = current {
+                                *map.entry(parent.to_path_buf()).or_insert(0) += file_size;
+                                current = parent.parent();
+                            }
                         }
                     }
                     (map, files, dirs, size)
@@ -380,18 +429,20 @@ impl Scanner {
             .reduce(
                 || (HashMap::new(), 0, 0, 0u64),
                 |(mut map_a, files_a, dirs_a, size_a), (map_b, files_b, dirs_b, size_b)| {
-                    // Merge maps
+                    // Merge directory size maps
                     for (path, size) in map_b {
                         *map_a.entry(path).or_insert(0) += size;
                     }
-                    // Merge stats
-                    total_files.fetch_add(files_a + files_b, Ordering::Relaxed);
-                    total_dirs.fetch_add(dirs_a + dirs_b, Ordering::Relaxed);
-                    total_size.fetch_add(size_a + size_b, Ordering::Relaxed);
-                    (map_a, 0, 0, 0)
+
+                    // Merge stats (accumulate in returned tuple, not atomics!)
+                    (map_a, files_a + files_b, dirs_a + dirs_b, size_a + size_b)
                 },
-            )
-            .0;
+            );
+
+        // Store final totals in atomics (do this ONCE, not during every reduce!)
+        total_files.store(final_files, Ordering::Relaxed);
+        total_dirs.store(final_dirs, Ordering::Relaxed);
+        total_size.store(final_size, Ordering::Relaxed);
 
         // Check if cancelled before constructing FileEntry objects
         if self.cancelled.load(Ordering::Relaxed) {
@@ -554,7 +605,27 @@ impl Scanner {
         let total_dirs = AtomicUsize::new(0);
         let total_size = AtomicU64::new(0);
 
-        let dir_sizes: HashMap<PathBuf, u64> = all_entries
+        // First pass: build inode -> (size, first_path) map to detect hard links
+        #[cfg(unix)]
+        let inode_map: HashMap<u64, (u64, PathBuf)> = {
+            use std::os::unix::fs::MetadataExt;
+            let mut map = HashMap::new();
+            for entry in &all_entries {
+                if !entry.file_type().is_dir() {
+                    if let Ok(metadata) = entry.metadata() {
+                        let inode = metadata.ino();
+                        let size = metadata.len();
+                        // Canonicalize path to handle symlinks like /tmp -> /private/tmp
+                        let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path().to_path_buf());
+                        // Only store first occurrence of each inode
+                        map.entry(inode).or_insert((size, path));
+                    }
+                }
+            }
+            map
+        };
+
+        let (dir_sizes, final_files, final_dirs, final_size) = all_entries
             .par_iter()
             .fold(
                 || (HashMap::new(), 0, 0, 0u64),
@@ -565,14 +636,43 @@ impl Scanner {
                         dirs += 1;
                     } else {
                         files += 1;
-                        let file_size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                        size += file_size;
 
-                        let path = entry.path();
-                        let mut current = path.parent();
-                        while let Some(parent) = current {
-                            *map.entry(parent.to_path_buf()).or_insert(0) += file_size;
-                            current = parent.parent();
+                        // Check if this is the first occurrence of this inode (Unix only)
+                        #[cfg(unix)]
+                        let (file_size, is_first_occurrence) = {
+                            use std::os::unix::fs::MetadataExt;
+                            if let Ok(metadata) = entry.metadata() {
+                                let inode = metadata.ino();
+                                // Canonicalize path to handle symlinks like /tmp -> /private/tmp
+                                let current_path = entry.path().canonicalize()
+                                    .unwrap_or_else(|_| entry.path().to_path_buf());
+                                // This is the first occurrence if the stored path matches current path
+                                let is_first = inode_map.get(&inode)
+                                    .map(|(_, first_path)| first_path == &current_path)
+                                    .unwrap_or(true);
+                                (metadata.len(), is_first)
+                            } else {
+                                (0, true)
+                            }
+                        };
+
+                        // On non-Unix, always count the file
+                        #[cfg(not(unix))]
+                        let (file_size, is_first_occurrence) = {
+                            let sz = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                            (sz, true)
+                        };
+
+                        // Only add to size totals if this is the first occurrence of this inode
+                        if is_first_occurrence {
+                            size += file_size;
+
+                            let path = entry.path();
+                            let mut current = path.parent();
+                            while let Some(parent) = current {
+                                *map.entry(parent.to_path_buf()).or_insert(0) += file_size;
+                                current = parent.parent();
+                            }
                         }
                     }
                     (map, files, dirs, size)
@@ -584,13 +684,15 @@ impl Scanner {
                     for (path, size) in map_b {
                         *map_a.entry(path).or_insert(0) += size;
                     }
-                    total_files.fetch_add(files_a + files_b, Ordering::Relaxed);
-                    total_dirs.fetch_add(dirs_a + dirs_b, Ordering::Relaxed);
-                    total_size.fetch_add(size_a + size_b, Ordering::Relaxed);
-                    (map_a, 0, 0, 0)
+                    // Merge stats (accumulate in returned tuple, not atomics!)
+                    (map_a, files_a + files_b, dirs_a + dirs_b, size_a + size_b)
                 },
-            )
-            .0;
+            );
+
+        // Store final totals in atomics (do this ONCE, not during every reduce!)
+        total_files.store(final_files, Ordering::Relaxed);
+        total_dirs.store(final_dirs, Ordering::Relaxed);
+        total_size.store(final_size, Ordering::Relaxed);
 
         // Check if cancelled before constructing FileEntry objects
         if self.cancelled.load(Ordering::Relaxed) {

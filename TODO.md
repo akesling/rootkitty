@@ -6,6 +6,16 @@
   scan so far
 * Show visualizations of space usage: tree view being most important, but also
   progressive pie chart might be valuable?
-* For garbage collection simplicity, etc. each scan should be its own table and
-  there should be a scans table that stores metadata about each scan, including
-  the table in which it is stored
+* It would be cool to be able to have multiple scans going at the same time /
+  have an interface where you can see what "background" scans are happening
+* Add support for scanning remote machines over SSH
+* Display a throbber during scan
+* Fix "active directories" for hybrid scan
+* Scans view should be made into a "tree" with scans at the leaves.  If two
+  scans are for the same root path, they should be siblings under a parent of
+  the path.  If a scan includes a sub-tree which has a particular scan
+  associated, that should be indicated clearly.
+* We seem to only be using 4 cores at about half capacity when we _should_ be
+  able to saturate all cores on the machine (should be a perfectly parallel
+  task).
+* Move this task list to Chox + chox-tui

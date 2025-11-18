@@ -209,11 +209,10 @@ impl App {
                             }
                             KeyCode::Char('r') => {
                                 // Resume paused scan
-                                if let Some(selected) = self.scan_list_state.selected() {
-                                    if let Some(scan) = self.scans.get(selected) {
+                                if let Some(scan_id) = self.get_selected_scan_id() {
+                                    if let Some(scan) = self.scans.iter().find(|s| s.id == scan_id) {
                                         if scan.status == "paused" {
                                             let path = scan.root_path.clone();
-                                            let scan_id = scan.id;
                                             if let Err(e) = self.resume_scan(scan_id, path).await {
                                                 self.status_message =
                                                     format!("Resume error: {}", e);
@@ -260,12 +259,10 @@ impl App {
                             }
                             KeyCode::Char('x') => {
                                 // Delete scan (with confirmation)
-                                if let Some(selected) = self.scan_list_state.selected() {
-                                    if let Some(scan) = self.scans.get(selected) {
-                                        self.delete_scan_id = Some(scan.id);
-                                        self.previous_view = View::ScanList;
-                                        self.view = View::ConfirmDelete;
-                                    }
+                                if let Some(scan_id) = self.get_selected_scan_id() {
+                                    self.delete_scan_id = Some(scan_id);
+                                    self.previous_view = View::ScanList;
+                                    self.view = View::ConfirmDelete;
                                 }
                                 self.g_pressed = false;
                             }
@@ -1270,16 +1267,8 @@ impl App {
     }
 
     fn render_scan_list(&mut self, f: &mut Frame, area: Rect) {
-        // Sort scans based on current sort mode
-        let mut sorted_scans = self.scans.clone();
-        match self.scan_list_sort {
-            SortMode::BySize => {
-                sorted_scans.sort_by(|a, b| b.total_size.cmp(&a.total_size));
-            }
-            SortMode::ByPath => {
-                sorted_scans.sort_by(|a, b| a.root_path.cmp(&b.root_path));
-            }
-        }
+        // Get sorted scans (matching what we use for selection)
+        let sorted_scans = self.get_sorted_scans();
 
         let items: Vec<ListItem> = sorted_scans
             .iter()
@@ -2090,10 +2079,29 @@ impl App {
         Ok(())
     }
 
+    fn get_sorted_scans(&self) -> Vec<Scan> {
+        let mut sorted_scans = self.scans.clone();
+        match self.scan_list_sort {
+            SortMode::BySize => {
+                sorted_scans.sort_by(|a, b| b.total_size.cmp(&a.total_size));
+            }
+            SortMode::ByPath => {
+                sorted_scans.sort_by(|a, b| a.root_path.cmp(&b.root_path));
+            }
+        }
+        sorted_scans
+    }
+
+    fn get_selected_scan_id(&self) -> Option<i64> {
+        let selected_index = self.scan_list_state.selected()?;
+        let sorted_scans = self.get_sorted_scans();
+        sorted_scans.get(selected_index).map(|scan| scan.id)
+    }
+
     fn select_scan(&mut self) -> Result<()> {
-        if let Some(selected) = self.scan_list_state.selected() {
-            if let Some(scan) = self.scans.get(selected).cloned() {
-                let scan_id = scan.id;
+        if let Some(scan_id) = self.get_selected_scan_id() {
+            // Find the full scan object by ID
+            if let Some(scan) = self.scans.iter().find(|s| s.id == scan_id).cloned() {
                 let db = self.db.clone();
 
                 // Spawn background task to load entries
