@@ -362,7 +362,10 @@ impl Scanner {
                         let inode = metadata.ino();
                         let size = metadata.len();
                         // Canonicalize path to handle symlinks like /tmp -> /private/tmp
-                        let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path().to_path_buf());
+                        let path = entry
+                            .path()
+                            .canonicalize()
+                            .unwrap_or_else(|_| entry.path().to_path_buf());
                         // Only store first occurrence of each inode
                         map.entry(inode).or_insert((size, path));
                     }
@@ -391,10 +394,13 @@ impl Scanner {
                             if let Ok(metadata) = entry.metadata() {
                                 let inode = metadata.ino();
                                 // Canonicalize path to handle symlinks like /tmp -> /private/tmp
-                                let current_path = entry.path().canonicalize()
+                                let current_path = entry
+                                    .path()
+                                    .canonicalize()
                                     .unwrap_or_else(|_| entry.path().to_path_buf());
                                 // This is the first occurrence if the stored path matches current path
-                                let is_first = inode_map.get(&inode)
+                                let is_first = inode_map
+                                    .get(&inode)
                                     .map(|(_, first_path)| first_path == &current_path)
                                     .unwrap_or(true);
                                 (metadata.len(), is_first)
@@ -616,7 +622,10 @@ impl Scanner {
                         let inode = metadata.ino();
                         let size = metadata.len();
                         // Canonicalize path to handle symlinks like /tmp -> /private/tmp
-                        let path = entry.path().canonicalize().unwrap_or_else(|_| entry.path().to_path_buf());
+                        let path = entry
+                            .path()
+                            .canonicalize()
+                            .unwrap_or_else(|_| entry.path().to_path_buf());
                         // Only store first occurrence of each inode
                         map.entry(inode).or_insert((size, path));
                     }
@@ -644,10 +653,13 @@ impl Scanner {
                             if let Ok(metadata) = entry.metadata() {
                                 let inode = metadata.ino();
                                 // Canonicalize path to handle symlinks like /tmp -> /private/tmp
-                                let current_path = entry.path().canonicalize()
+                                let current_path = entry
+                                    .path()
+                                    .canonicalize()
                                     .unwrap_or_else(|_| entry.path().to_path_buf());
                                 // This is the first occurrence if the stored path matches current path
-                                let is_first = inode_map.get(&inode)
+                                let is_first = inode_map
+                                    .get(&inode)
                                     .map(|(_, first_path)| first_path == &current_path)
                                     .unwrap_or(true);
                                 (metadata.len(), is_first)

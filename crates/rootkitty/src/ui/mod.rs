@@ -1,3 +1,4 @@
+mod scan_tree;
 mod tree;
 mod types;
 
@@ -106,6 +107,10 @@ pub struct App {
     search_query: String,
     /// Whether we're actively in search input mode
     search_mode: bool,
+    /// Tree structure for organizing scans by path
+    scan_tree: Vec<scan_tree::ScanTreeNode>,
+    /// Flattened scan tree for display
+    flat_scan_tree: Vec<scan_tree::FlatScanNode>,
 }
 
 impl App {
@@ -151,6 +156,8 @@ impl App {
             follow_symlinks: settings.scan.follow_symlinks,
             search_query: String::new(),
             search_mode: false,
+            scan_tree: Vec::new(),
+            flat_scan_tree: Vec::new(),
         }
     }
 
@@ -210,7 +217,8 @@ impl App {
                             KeyCode::Char('r') => {
                                 // Resume paused scan
                                 if let Some(scan_id) = self.get_selected_scan_id() {
-                                    if let Some(scan) = self.scans.iter().find(|s| s.id == scan_id) {
+                                    if let Some(scan) = self.scans.iter().find(|s| s.id == scan_id)
+                                    {
                                         if scan.status == "paused" {
                                             let path = scan.root_path.clone();
                                             if let Err(e) = self.resume_scan(scan_id, path).await {
@@ -257,6 +265,32 @@ impl App {
                                 self.scan_list_page_up();
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('z') => {
+                                // Toggle fold/unfold for selected tree node
+                                self.toggle_scan_tree_fold();
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('o') => {
+                                // Open scan if ScanNode, or toggle fold if PathNode
+                                if let Some(selected_index) = self.scan_list_state.selected() {
+                                    if let Some(flat_node) = self.flat_scan_tree.get(selected_index)
+                                    {
+                                        match &flat_node.node {
+                                            scan_tree::ScanTreeNode::ScanNode { .. } => {
+                                                // It's a scan - open it
+                                                if let Err(e) = self.select_scan() {
+                                                    self.status_message = format!("Error: {}", e);
+                                                }
+                                            }
+                                            scan_tree::ScanTreeNode::PathNode { .. } => {
+                                                // It's a path node - toggle fold/unfold
+                                                self.toggle_scan_tree_fold();
+                                            }
+                                        }
+                                    }
+                                }
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('x') => {
                                 // Delete scan (with confirmation)
                                 if let Some(scan_id) = self.get_selected_scan_id() {
@@ -266,7 +300,7 @@ impl App {
                                 }
                                 self.g_pressed = false;
                             }
-                            KeyCode::Enter | KeyCode::Char('o') => {
+                            KeyCode::Enter => {
                                 if let Err(e) = self.select_scan() {
                                     self.status_message = format!("Error: {}", e);
                                 }
@@ -1267,28 +1301,75 @@ impl App {
     }
 
     fn render_scan_list(&mut self, f: &mut Frame, area: Rect) {
-        // Get sorted scans (matching what we use for selection)
-        let sorted_scans = self.get_sorted_scans();
-
-        let items: Vec<ListItem> = sorted_scans
+        let items: Vec<ListItem> = self
+            .flat_scan_tree
             .iter()
-            .map(|scan| {
-                let size_mb = scan.total_size as f64 / 1_048_576.0;
-                let status = match scan.status.as_str() {
-                    "completed" => "✓",
-                    "running" => "⟳",
-                    "paused" => "⏸",
-                    _ => "✗",
-                };
-                let content = format!(
-                    "{} {} | {} files | {:.2} MB | {}",
-                    status,
-                    scan.root_path,
-                    scan.total_files,
-                    size_mb,
-                    scan.started_at.format("%Y-%m-%d %H:%M")
-                );
-                ListItem::new(content)
+            .enumerate()
+            .map(|(idx, flat_node)| {
+                let indent = "  ".repeat(flat_node.depth);
+
+                match &flat_node.node {
+                    scan_tree::ScanTreeNode::PathNode {
+                        name,
+                        full_path,
+                        children,
+                        folded,
+                    } => {
+                        // Check if this path node has only scan children (no other path nodes)
+                        let has_only_scans = children
+                            .iter()
+                            .all(|child| matches!(child, scan_tree::ScanTreeNode::ScanNode { .. }));
+
+                        let icon = if *folded { "▶" } else { "▼" };
+                        let child_count = children.len();
+
+                        let content = if has_only_scans && child_count > 0 {
+                            // This is a path with scans - show the full path
+                            let display_path = self.get_scan_display_path(full_path, idx);
+                            format!(
+                                "{}{} {}/ ({} {})",
+                                indent,
+                                icon,
+                                display_path,
+                                child_count,
+                                if child_count == 1 { "scan" } else { "scans" }
+                            )
+                        } else {
+                            // This is an intermediate path node
+                            // Add leading slash if this is at root level (depth 0)
+                            let display_name = if flat_node.depth == 0 && !name.starts_with('/') {
+                                format!("/{}", name)
+                            } else {
+                                name.clone()
+                            };
+                            format!("{}{} {}/", indent, icon, display_name)
+                        };
+
+                        ListItem::new(content).style(Style::default().fg(Color::Cyan))
+                    }
+                    scan_tree::ScanTreeNode::ScanNode { scan, has_subscans } => {
+                        let size_mb = scan.total_size as f64 / 1_048_576.0;
+                        let status = match scan.status.as_str() {
+                            "completed" => "✓",
+                            "running" => "⟳",
+                            "paused" => "⏸",
+                            _ => "✗",
+                        };
+                        let subscan_indicator = if *has_subscans { " [+]" } else { "" };
+
+                        // Scan nodes are children of a path node, so just show the details
+                        let content = format!(
+                            "{}  📊 {} | {} files | {:.2} MB | {}{}",
+                            indent,
+                            status,
+                            scan.total_files,
+                            size_mb,
+                            scan.started_at.format("%Y-%m-%d %H:%M"),
+                            subscan_indicator
+                        );
+                        ListItem::new(content)
+                    }
+                }
             })
             .collect();
 
@@ -1300,7 +1381,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Scans (1) | Enter: view | r: resume paused | n: new | ↑/↓ or j/k: navigate")
+                    .title("Scans (1) | o/Enter: open | z: fold/unfold | r: resume | n: new | ↑/↓ or j/k: navigate")
                     .title_top(
                         Line::from(format!(" DB: {} ", db_size_str))
                             .right_aligned()
@@ -2058,10 +2139,19 @@ impl App {
         // Reload after fixing up statuses
         self.scans = self.db.list_scans().await?;
 
+        // Rebuild the scan tree
+        self.rebuild_scan_tree();
+
         if !self.scans.is_empty() && self.scan_list_state.selected().is_none() {
             self.scan_list_state.select(Some(0));
         }
         Ok(())
+    }
+
+    /// Rebuild the scan tree from the current list of scans
+    fn rebuild_scan_tree(&mut self) {
+        self.scan_tree = scan_tree::build_scan_tree(&self.scans);
+        self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
     }
 
     fn save_settings(&self) -> Result<()> {
@@ -2094,8 +2184,13 @@ impl App {
 
     fn get_selected_scan_id(&self) -> Option<i64> {
         let selected_index = self.scan_list_state.selected()?;
-        let sorted_scans = self.get_sorted_scans();
-        sorted_scans.get(selected_index).map(|scan| scan.id)
+        let flat_node = self.flat_scan_tree.get(selected_index)?;
+
+        // Only return a scan ID if the selected node is a ScanNode
+        match &flat_node.node {
+            scan_tree::ScanTreeNode::ScanNode { scan, .. } => Some(scan.id),
+            scan_tree::ScanTreeNode::PathNode { .. } => None,
+        }
     }
 
     fn select_scan(&mut self) -> Result<()> {
@@ -2620,12 +2715,12 @@ impl App {
     }
 
     fn scan_list_next(&mut self) {
-        if self.scans.is_empty() {
+        if self.flat_scan_tree.is_empty() {
             return;
         }
         let i = match self.scan_list_state.selected() {
             Some(i) => {
-                if i >= self.scans.len() - 1 {
+                if i >= self.flat_scan_tree.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -2637,13 +2732,13 @@ impl App {
     }
 
     fn scan_list_previous(&mut self) {
-        if self.scans.is_empty() {
+        if self.flat_scan_tree.is_empty() {
             return;
         }
         let i = match self.scan_list_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.scans.len() - 1
+                    self.flat_scan_tree.len() - 1
                 } else {
                     i - 1
                 }
@@ -2654,27 +2749,28 @@ impl App {
     }
 
     fn scan_list_top(&mut self) {
-        if !self.scans.is_empty() {
+        if !self.flat_scan_tree.is_empty() {
             self.scan_list_state.select(Some(0));
         }
     }
 
     fn scan_list_bottom(&mut self) {
-        if !self.scans.is_empty() {
-            self.scan_list_state.select(Some(self.scans.len() - 1));
+        if !self.flat_scan_tree.is_empty() {
+            self.scan_list_state
+                .select(Some(self.flat_scan_tree.len() - 1));
         }
     }
 
     fn scan_list_page_down(&mut self) {
-        if self.scans.is_empty() {
+        if self.flat_scan_tree.is_empty() {
             return;
         }
         let page_size = 10; // Move 10 items at a time
         let i = match self.scan_list_state.selected() {
             Some(i) => {
                 let new_pos = i + page_size;
-                if new_pos >= self.scans.len() {
-                    self.scans.len() - 1
+                if new_pos >= self.flat_scan_tree.len() {
+                    self.flat_scan_tree.len() - 1
                 } else {
                     new_pos
                 }
@@ -2685,7 +2781,7 @@ impl App {
     }
 
     fn scan_list_page_up(&mut self) {
-        if self.scans.is_empty() {
+        if self.flat_scan_tree.is_empty() {
             return;
         }
         let page_size = 10; // Move 10 items at a time
@@ -2694,6 +2790,74 @@ impl App {
             None => 0,
         };
         self.scan_list_state.select(Some(i));
+    }
+
+    /// Toggle fold/unfold for the currently selected scan tree node
+    fn toggle_scan_tree_fold(&mut self) {
+        if let Some(selected_index) = self.scan_list_state.selected() {
+            if let Some(flat_node) = self.flat_scan_tree.get(selected_index) {
+                let path = flat_node.node.full_path().to_string();
+
+                // Toggle the fold state in the tree
+                scan_tree::toggle_fold(&mut self.scan_tree, &path);
+
+                // Rebuild the flat tree to reflect the change
+                self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
+            }
+        }
+    }
+
+    /// Unfold the currently selected scan tree node (if it's a PathNode)
+    fn unfold_scan_tree_node(&mut self) {
+        if let Some(selected_index) = self.scan_list_state.selected() {
+            if let Some(flat_node) = self.flat_scan_tree.get(selected_index) {
+                let path = flat_node.node.full_path().to_string();
+
+                // Unfold the node in the tree
+                scan_tree::unfold(&mut self.scan_tree, &path);
+
+                // Rebuild the flat tree to reflect the change
+                self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
+            }
+        }
+    }
+
+    /// Get the display path for a scan, clipping the parent path if the scan is nested
+    fn get_scan_display_path(&self, scan_path: &str, flat_index: usize) -> String {
+        // If this is at depth 0, show full path
+        if flat_index == 0
+            || self
+                .flat_scan_tree
+                .get(flat_index)
+                .map(|n| n.depth)
+                .unwrap_or(0)
+                == 0
+        {
+            return scan_path.to_string();
+        }
+
+        // Find the nearest ancestor PathNode by walking backwards
+        let current_depth = self.flat_scan_tree[flat_index].depth;
+
+        for i in (0..flat_index).rev() {
+            if let Some(ancestor) = self.flat_scan_tree.get(i) {
+                if ancestor.depth < current_depth {
+                    // This is a parent node
+                    if let scan_tree::ScanTreeNode::PathNode { full_path, .. } = &ancestor.node {
+                        // Clip the parent path from the scan path
+                        let parent_path = full_path.trim_end_matches('/');
+                        if scan_path.starts_with(parent_path) {
+                            let relative = &scan_path[parent_path.len()..];
+                            return relative.trim_start_matches('/').to_string();
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Fallback to showing full path
+        scan_path.to_string()
     }
 
     fn file_list_next(&mut self) {

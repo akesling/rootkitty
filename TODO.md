@@ -19,3 +19,5 @@
   able to saturate all cores on the machine (should be a perfectly parallel
   task).
 * Move this task list to Chox + chox-tui
+* Shortcuts at the bottom of the screen extend off the right side / are cut off.
+* Shortcuts page should be scrollable
