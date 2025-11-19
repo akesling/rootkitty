@@ -1,5 +1,6 @@
 mod scan_tree;
 mod tree;
+mod treemap;
 mod types;
 
 pub use types::{SortMode, View};
@@ -111,6 +112,14 @@ pub struct App {
     scan_tree: Vec<scan_tree::ScanTreeNode>,
     /// Flattened scan tree for display
     flat_scan_tree: Vec<scan_tree::FlatScanNode>,
+    /// Whether to show treemap instead of file list
+    treemap_mode: bool,
+    /// Selected rectangle index in treemap
+    treemap_selected: usize,
+    /// Current path being viewed in treemap
+    treemap_path: String,
+    /// File entry being viewed in detail
+    detail_file: Option<StoredFileEntry>,
 }
 
 impl App {
@@ -158,6 +167,10 @@ impl App {
             search_mode: false,
             scan_tree: Vec::new(),
             flat_scan_tree: Vec::new(),
+            treemap_mode: false,
+            treemap_selected: 0,
+            treemap_path: String::from("/"),
+            detail_file: None,
         }
     }
 
@@ -379,6 +392,132 @@ impl App {
                                     }
                                     _ => {}
                                 }
+                            } else if self.treemap_mode {
+                                // Treemap navigation
+                                match key.code {
+                                    KeyCode::Char('q') => return Ok(()),
+                                    KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('u') => {
+                                        // Exit treemap mode or go up one level
+                                        if self.treemap_path.is_empty() {
+                                            // Already at root, exit treemap mode
+                                            self.treemap_mode = false;
+                                            self.status_message = "Exited treemap mode".to_string();
+                                        } else {
+                                            // Go up one level in the treemap
+                                            // Find parent directory
+                                            if let Some(parent_idx) = self.treemap_path.rfind('/') {
+                                                if parent_idx == 0 {
+                                                    // Parent is root
+                                                    self.treemap_path.clear();
+                                                } else {
+                                                    self.treemap_path =
+                                                        self.treemap_path[..parent_idx].to_string();
+                                                }
+                                            } else {
+                                                self.treemap_path.clear();
+                                            }
+                                            self.treemap_selected = 0;
+                                            self.status_message = format!(
+                                                "Treemap path: {}",
+                                                if self.treemap_path.is_empty() {
+                                                    "/"
+                                                } else {
+                                                    &self.treemap_path
+                                                }
+                                            );
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('T') => {
+                                        // Toggle treemap mode off
+                                        self.treemap_mode = false;
+                                        self.status_message = "Exited treemap mode".to_string();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        // Next rectangle
+                                        self.treemap_selected =
+                                            self.treemap_selected.saturating_add(1);
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        // Previous rectangle
+                                        self.treemap_selected =
+                                            self.treemap_selected.saturating_sub(1);
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        // Next rectangle (same as down for now)
+                                        self.treemap_selected =
+                                            self.treemap_selected.saturating_add(1);
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        // Previous rectangle (same as up for now)
+                                        self.treemap_selected =
+                                            self.treemap_selected.saturating_sub(1);
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Enter | KeyCode::Char('o') => {
+                                        // Drill down into selected directory
+                                        // Get the selected entry from the treemap (only direct children)
+                                        let all_entries = self.get_visible_entries();
+                                        let current_entries: Vec<StoredFileEntry> =
+                                            if self.treemap_path.is_empty() {
+                                                all_entries
+                                                    .into_iter()
+                                                    .filter(|e| e.depth == 0)
+                                                    .map(|e| e.clone())
+                                                    .collect()
+                                            } else {
+                                                all_entries
+                                                    .into_iter()
+                                                    .filter(|e| {
+                                                        if let Some(ref parent) = e.parent_path {
+                                                            parent == &self.treemap_path
+                                                        } else {
+                                                            false
+                                                        }
+                                                    })
+                                                    .map(|e| e.clone())
+                                                    .collect()
+                                            };
+
+                                        if let Some(entry) =
+                                            current_entries.get(self.treemap_selected)
+                                        {
+                                            if entry.is_dir {
+                                                // Drill into this directory
+                                                let dir_path = entry.path.clone();
+
+                                                // Unfold the directory to ensure children are loaded
+                                                if let Err(e) =
+                                                    self.unfold_directory_by_path(&dir_path).await
+                                                {
+                                                    self.status_message =
+                                                        format!("Error loading directory: {}", e);
+                                                    self.g_pressed = false;
+                                                    return Ok(());
+                                                }
+
+                                                self.treemap_path = dir_path;
+                                                self.treemap_selected = 0;
+                                                self.status_message =
+                                                    format!("Treemap path: {}", self.treemap_path);
+                                            } else {
+                                                // It's a file - show file detail view
+                                                self.detail_file = Some(entry.clone());
+                                                self.previous_view = View::FileTree;
+                                                self.view = View::FileDetail;
+                                                self.treemap_mode = false; // Exit treemap mode
+                                            }
+                                        }
+                                        self.g_pressed = false;
+                                    }
+                                    _ => {
+                                        self.g_pressed = false;
+                                    }
+                                }
                             } else {
                                 // Normal file tree navigation
                                 match key.code {
@@ -502,6 +641,46 @@ impl App {
                                             "File tree sort: {}",
                                             self.file_tree_sort.display_name()
                                         );
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('T') => {
+                                        // Shift+T - toggle treemap mode
+                                        self.treemap_mode = !self.treemap_mode;
+                                        if self.treemap_mode {
+                                            // Initialize treemap for current path
+                                            self.treemap_selected = 0;
+                                            if let Some(selected) = self.file_list_state.selected()
+                                            {
+                                                let visible = self.get_visible_entries();
+                                                if let Some(entry) = visible.get(selected) {
+                                                    let entry_path = entry.path.clone();
+                                                    let entry_is_dir = entry.is_dir;
+
+                                                    self.treemap_path = entry_path.clone();
+
+                                                    // If it's a directory, unfold it to ensure children are loaded
+                                                    if entry_is_dir {
+                                                        if let Err(e) = self
+                                                            .unfold_directory_by_path(&entry_path)
+                                                            .await
+                                                        {
+                                                            self.status_message = format!(
+                                                                "Error loading directory: {}",
+                                                                e
+                                                            );
+                                                            self.treemap_mode = false;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if self.treemap_mode {
+                                                self.status_message =
+                                                    "Treemap mode enabled".to_string();
+                                            }
+                                        } else {
+                                            self.status_message =
+                                                "Treemap mode disabled".to_string();
+                                        }
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Char('S') => {
@@ -1001,6 +1180,18 @@ impl App {
                                 }
                             }
                         }
+                        View::FileDetail => match key.code {
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Esc => {
+                                // Go back to file tree
+                                self.view = View::FileTree;
+                                self.detail_file = None;
+                                self.g_pressed = false;
+                            }
+                            _ => {
+                                self.g_pressed = false;
+                            }
+                        },
                     }
                 }
             }
@@ -1298,6 +1489,7 @@ impl App {
             View::PreparingResume => self.render_preparing_resume(f, main_chunks[0]),
             View::Settings => self.render_settings(f, main_chunks[0]),
             View::ConfirmPathChange => self.render_confirm_path_change(f, main_chunks[0]),
+            View::FileDetail => self.render_file_detail(f, main_chunks[0]),
         }
 
         let status_idx = if use_info_pane { 2 } else { 1 };
@@ -1408,6 +1600,12 @@ impl App {
     }
 
     fn render_file_tree(&mut self, f: &mut Frame, area: Rect) {
+        // If treemap mode is enabled, render treemap instead
+        if self.treemap_mode {
+            self.render_treemap_interactive(f, area);
+            return;
+        }
+
         // Check if we're loading a scan (task active and no entries yet)
         if self.loading_task.is_some() && self.file_entries.is_empty() {
             // Show centered loading throbber
@@ -1501,7 +1699,58 @@ impl App {
     }
 
     fn render_file_info(&self, f: &mut Frame, area: Rect) {
-        let info_text = if let Some(selected) = self.file_list_state.selected() {
+        let info_text = if self.treemap_mode {
+            // In treemap mode, show info for the selected treemap item
+            let all_entries = self.get_visible_entries();
+            let current_entries: Vec<StoredFileEntry> = if self.treemap_path.is_empty() {
+                all_entries
+                    .into_iter()
+                    .filter(|e| e.depth == 0)
+                    .map(|e| e.clone())
+                    .collect()
+            } else {
+                all_entries
+                    .into_iter()
+                    .filter(|e| {
+                        if let Some(ref parent) = e.parent_path {
+                            parent == &self.treemap_path
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|e| e.clone())
+                    .collect()
+            };
+
+            if let Some(entry) = current_entries.get(self.treemap_selected) {
+                let file_type = if entry.is_dir { "Directory" } else { "File" }.to_string();
+                let size_str = format_size(entry.size as u64);
+                let name = entry.name.clone();
+                let path = entry.path.clone();
+
+                vec![
+                    Line::from(vec![
+                        Span::styled("Type: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(file_type),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Name: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(name),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Path: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(path),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("Size: ", Style::default().fg(Color::Yellow)),
+                        Span::raw(size_str),
+                    ]),
+                ]
+            } else {
+                vec![Line::from("No file selected")]
+            }
+        } else if let Some(selected) = self.file_list_state.selected() {
+            // In normal file tree mode, show info for the selected file
             let visible_entries = self.get_visible_entries();
             if let Some(entry) = visible_entries.get(selected) {
                 let file_type = if entry.is_dir { "Directory" } else { "File" };
@@ -1588,6 +1837,288 @@ impl App {
             .wrap(Wrap { trim: false });
 
         f.render_widget(paragraph, area);
+    }
+
+    fn render_treemap(&self, f: &mut Frame, area: Rect) {
+        // Build treemap from visible file entries (top level only to start)
+        let visible = self.get_visible_entries();
+        let top_level: Vec<StoredFileEntry> = visible
+            .into_iter()
+            .filter(|e| e.depth == 0)
+            .map(|e| e.clone())
+            .collect();
+
+        if top_level.is_empty() {
+            let text = vec![
+                Line::from(""),
+                Line::from("No files to display in treemap"),
+                Line::from(""),
+                Line::from("Press Esc to go back"),
+            ];
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("Treemap (4)"));
+            f.render_widget(paragraph, area);
+            return;
+        }
+
+        let treemap_rects = treemap::build_treemap(&top_level, area, 0);
+
+        // Color palette for different depths
+        let colors = [
+            Color::Red,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Cyan,
+            Color::LightRed,
+            Color::LightGreen,
+        ];
+
+        // Render using blocks for each rectangle
+        for treemap_rect in &treemap_rects {
+            let rect = treemap_rect.rect;
+
+            // Skip tiny rectangles
+            if rect.width < 3 || rect.height < 2 {
+                continue;
+            }
+
+            let color = colors[treemap_rect.color_index % colors.len()];
+            let size_str = format_size(treemap_rect.entry.size as u64);
+
+            // For larger rectangles, show name and size
+            let title = if rect.width > size_str.len() as u16 + 4 {
+                format!("{} ({})", treemap_rect.entry.name, size_str)
+            } else if rect.width > size_str.len() as u16 {
+                size_str.clone()
+            } else {
+                String::new()
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(title)
+                .style(Style::default().bg(color).fg(Color::Black));
+
+            f.render_widget(block, rect);
+        }
+    }
+
+    fn render_treemap_interactive(&mut self, f: &mut Frame, area: Rect) {
+        // Filter entries by current treemap path - only direct children
+        let all_entries = self.get_visible_entries();
+        let current_entries: Vec<StoredFileEntry> = if self.treemap_path.is_empty() {
+            // Show top level entries
+            all_entries
+                .into_iter()
+                .filter(|e| e.depth == 0)
+                .map(|e| e.clone())
+                .collect()
+        } else {
+            // Show only direct children of treemap_path (not all descendants)
+            // Direct children have parent_path == treemap_path
+            all_entries
+                .into_iter()
+                .filter(|e| {
+                    if let Some(ref parent) = e.parent_path {
+                        parent == &self.treemap_path
+                    } else {
+                        false
+                    }
+                })
+                .map(|e| e.clone())
+                .collect()
+        };
+
+        if current_entries.is_empty() {
+            let text = vec![
+                Line::from(""),
+                Line::from("No files to display in treemap"),
+                Line::from(""),
+                Line::from("Press T to exit treemap mode"),
+            ];
+            let title = format!(
+                "Treemap | Path: {}",
+                if self.treemap_path.is_empty() {
+                    "/"
+                } else {
+                    &self.treemap_path
+                }
+            );
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title(title));
+            f.render_widget(paragraph, area);
+            return;
+        }
+
+        // Build treemap
+        let treemap_rects = treemap::build_treemap(&current_entries, area, 0);
+
+        // Ensure selected index is in range
+        if self.treemap_selected >= treemap_rects.len() {
+            self.treemap_selected = treemap_rects.len().saturating_sub(1);
+        }
+
+        // Color palette for different depths
+        let colors = [
+            Color::Red,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Cyan,
+            Color::LightRed,
+            Color::LightGreen,
+        ];
+
+        // Render using blocks for each rectangle
+        for (idx, treemap_rect) in treemap_rects.iter().enumerate() {
+            let rect = treemap_rect.rect;
+
+            // Skip tiny rectangles
+            if rect.width < 3 || rect.height < 2 {
+                continue;
+            }
+
+            let is_selected = idx == self.treemap_selected;
+            // Use index instead of depth for colors so each item gets a different color
+            let color = colors[idx % colors.len()];
+            let size_str = format_size(treemap_rect.entry.size as u64);
+
+            // For larger rectangles, show name and size
+            let title =
+                if rect.width > size_str.len() as u16 + treemap_rect.entry.name.len() as u16 + 5 {
+                    format!("{} ({})", treemap_rect.entry.name, size_str)
+                } else if rect.width > treemap_rect.entry.name.len() as u16 + 2 {
+                    treemap_rect.entry.name.clone()
+                } else if rect.width > size_str.len() as u16 {
+                    size_str.clone()
+                } else {
+                    String::new()
+                };
+
+            // Use white text on colored backgrounds for better visibility
+            let mut style = Style::default().bg(color).fg(Color::White);
+            let mut border_style = Style::default().fg(color);
+
+            if is_selected {
+                // Highlight selected rectangle with bright white border
+                border_style = border_style.fg(Color::White).add_modifier(Modifier::BOLD);
+                style = style.add_modifier(Modifier::BOLD);
+            }
+
+            // Create styled title with white text and bold
+            let styled_title = if !title.is_empty() {
+                Line::from(vec![Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )])
+            } else {
+                Line::from("")
+            };
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(styled_title)
+                .style(style);
+
+            f.render_widget(block, rect);
+        }
+    }
+
+    fn render_file_detail(&self, f: &mut Frame, area: Rect) {
+        if let Some(file) = &self.detail_file {
+            let mut lines = vec![
+                Line::from(""),
+                Line::from(vec![Span::styled(
+                    "File Details",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Name: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(&file.name),
+                ]),
+                Line::from(vec![
+                    Span::styled("Path: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(&file.path),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Size: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(format_size(file.size as u64)),
+                    Span::raw(format!(" ({} bytes)", file.size)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Type: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(if file.is_dir { "Directory" } else { "File" }),
+                ]),
+                Line::from(vec![
+                    Span::styled("Depth: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(file.depth.to_string()),
+                ]),
+                Line::from(""),
+            ];
+
+            if let Some(parent) = &file.parent_path {
+                lines.push(Line::from(vec![
+                    Span::styled("Parent: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(parent),
+                ]));
+                lines.push(Line::from(""));
+            }
+
+            if let Some(modified) = &file.modified_at {
+                lines.push(Line::from(vec![
+                    Span::styled("Modified: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(modified.format("%Y-%m-%d %H:%M:%S").to_string()),
+                ]));
+                lines.push(Line::from(""));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("Scan ID: ", Style::default().fg(Color::Yellow)),
+                Span::raw(file.scan_id.to_string()),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Entry ID: ", Style::default().fg(Color::Yellow)),
+                Span::raw(file.id.to_string()),
+            ]));
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "Press Esc to go back",
+                Style::default().fg(Color::Gray),
+            )]));
+
+            let paragraph = Paragraph::new(lines)
+                .alignment(Alignment::Left)
+                .block(Block::default().borders(Borders::ALL).title("File Details"))
+                .wrap(Wrap { trim: false });
+
+            f.render_widget(paragraph, area);
+        } else {
+            let text = vec![
+                Line::from(""),
+                Line::from("No file selected"),
+                Line::from(""),
+                Line::from("Press Esc to go back"),
+            ];
+            let paragraph = Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title("File Details"));
+            f.render_widget(paragraph, area);
+        }
     }
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
@@ -2095,6 +2626,9 @@ impl App {
             View::ConfirmPathChange => {
                 "y: apply change | n/Esc: keep old path"
             }
+            View::FileDetail => {
+                "Esc: back to file tree"
+            }
         };
 
         // Combine status message and help text into a single line
@@ -2235,6 +2769,47 @@ impl App {
         Ok(())
     }
 
+    async fn unfold_directory_by_path(&mut self, dir_path: &str) -> Result<()> {
+        // Helper method to unfold a specific directory and load its children
+        if !self.folded_dirs.contains(dir_path) {
+            // Already unfolded
+            return Ok(());
+        }
+
+        // Check if children are already loaded
+        let children_already_loaded = self.file_entries.iter().any(|e| {
+            e.path.starts_with(&format!("{}/", dir_path))
+                || (e.path.len() > dir_path.len()
+                    && e.path.starts_with(dir_path)
+                    && e.path.as_bytes().get(dir_path.len()) == Some(&b'/'))
+        });
+
+        if children_already_loaded {
+            // Just unfold
+            self.folded_dirs.remove(dir_path);
+        } else {
+            // Need to load from database
+            if let Some(scan) = &self.current_scan {
+                let scan_id = scan.id;
+                let db = self.db.clone();
+                let parent_path = dir_path.to_string();
+
+                let task = tokio::spawn(async move {
+                    let entries = db
+                        .get_entries_by_parent(scan_id, Some(&parent_path))
+                        .await?;
+                    Ok(LoadingResult::DirectoryChildren(parent_path, entries))
+                });
+
+                self.loading_task = Some(task);
+                self.loading_path = Some(dir_path.to_string());
+                self.loading_throbber_frame = 0;
+            }
+        }
+
+        Ok(())
+    }
+
     fn initialize_folded_state(&mut self) {
         // Fold all directories except the root (depth 0)
         for entry in &self.file_entries {
@@ -2249,7 +2824,10 @@ impl App {
             let visible_entries = self.get_visible_entries();
             if let Some(entry) = visible_entries.get(selected) {
                 if !entry.is_dir {
-                    self.status_message = "Not a directory".to_string();
+                    // It's a file - open file detail view
+                    self.detail_file = Some((*entry).clone());
+                    self.previous_view = View::FileTree;
+                    self.view = View::FileDetail;
                     return Ok(());
                 }
 

@@ -38,6 +38,7 @@ pub enum View {
     PreparingResume,
     Settings,
     ConfirmPathChange,
+    FileDetail,
 }
 
 #[derive(Debug, Clone)]
