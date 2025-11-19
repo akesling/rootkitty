@@ -114,8 +114,6 @@ pub struct App {
     flat_scan_tree: Vec<scan_tree::FlatScanNode>,
     /// Whether to show treemap instead of file list
     treemap_mode: bool,
-    /// Selected rectangle index in treemap
-    treemap_selected: usize,
     /// Current path being viewed in treemap
     treemap_path: String,
     /// File entry being viewed in detail
@@ -168,7 +166,6 @@ impl App {
             scan_tree: Vec::new(),
             flat_scan_tree: Vec::new(),
             treemap_mode: false,
-            treemap_selected: 0,
             treemap_path: String::from("/"),
             detail_file: None,
         }
@@ -416,7 +413,7 @@ impl App {
                                             } else {
                                                 self.treemap_path.clear();
                                             }
-                                            self.treemap_selected = 0;
+                                            self.set_treemap_selection(0);
                                             self.status_message = format!(
                                                 "Treemap path: {}",
                                                 if self.treemap_path.is_empty() {
@@ -436,80 +433,58 @@ impl App {
                                     }
                                     KeyCode::Down | KeyCode::Char('j') => {
                                         // Next rectangle
-                                        self.treemap_selected =
-                                            self.treemap_selected.saturating_add(1);
+                                        self.navigate_treemap_selection(1);
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Up | KeyCode::Char('k') => {
                                         // Previous rectangle
-                                        self.treemap_selected =
-                                            self.treemap_selected.saturating_sub(1);
+                                        self.navigate_treemap_selection(-1);
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Right | KeyCode::Char('l') => {
                                         // Next rectangle (same as down for now)
-                                        self.treemap_selected =
-                                            self.treemap_selected.saturating_add(1);
+                                        self.navigate_treemap_selection(1);
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Left | KeyCode::Char('h') => {
                                         // Previous rectangle (same as up for now)
-                                        self.treemap_selected =
-                                            self.treemap_selected.saturating_sub(1);
+                                        self.navigate_treemap_selection(-1);
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Enter | KeyCode::Char('o') => {
                                         // Drill down into selected directory
-                                        // Get the selected entry from the treemap (only direct children)
-                                        let all_entries = self.get_visible_entries();
-                                        let current_entries: Vec<StoredFileEntry> =
-                                            if self.treemap_path.is_empty() {
-                                                all_entries
-                                                    .into_iter()
-                                                    .filter(|e| e.depth == 0)
-                                                    .map(|e| e.clone())
-                                                    .collect()
-                                            } else {
-                                                all_entries
-                                                    .into_iter()
-                                                    .filter(|e| {
-                                                        if let Some(ref parent) = e.parent_path {
-                                                            parent == &self.treemap_path
-                                                        } else {
-                                                            false
-                                                        }
-                                                    })
-                                                    .map(|e| e.clone())
-                                                    .collect()
-                                            };
+                                        let current_entries = self.get_treemap_entries();
+                                        if let Some(treemap_idx) = self.get_treemap_selection() {
+                                            if let Some(entry) = current_entries.get(treemap_idx) {
+                                                if entry.is_dir {
+                                                    // Drill into this directory
+                                                    let dir_path = entry.path.clone();
 
-                                        if let Some(entry) =
-                                            current_entries.get(self.treemap_selected)
-                                        {
-                                            if entry.is_dir {
-                                                // Drill into this directory
-                                                let dir_path = entry.path.clone();
+                                                    // Ensure children are loaded for treemap
+                                                    if let Err(e) =
+                                                        self.ensure_children_loaded(&dir_path).await
+                                                    {
+                                                        self.status_message = format!(
+                                                            "Error loading directory: {}",
+                                                            e
+                                                        );
+                                                        self.g_pressed = false;
+                                                        return Ok(());
+                                                    }
 
-                                                // Unfold the directory to ensure children are loaded
-                                                if let Err(e) =
-                                                    self.unfold_directory_by_path(&dir_path).await
-                                                {
-                                                    self.status_message =
-                                                        format!("Error loading directory: {}", e);
-                                                    self.g_pressed = false;
-                                                    return Ok(());
+                                                    self.treemap_path = dir_path;
+                                                    self.set_treemap_selection(0);
+                                                    self.status_message = format!(
+                                                        "Treemap path: {}",
+                                                        self.treemap_path
+                                                    );
+                                                } else {
+                                                    // It's a file - show file detail view
+                                                    self.detail_file = Some(entry.clone());
+                                                    self.previous_view = View::FileTree;
+                                                    self.view = View::FileDetail;
+                                                    self.treemap_mode = false; // Exit treemap mode
                                                 }
-
-                                                self.treemap_path = dir_path;
-                                                self.treemap_selected = 0;
-                                                self.status_message =
-                                                    format!("Treemap path: {}", self.treemap_path);
-                                            } else {
-                                                // It's a file - show file detail view
-                                                self.detail_file = Some(entry.clone());
-                                                self.previous_view = View::FileTree;
-                                                self.view = View::FileDetail;
-                                                self.treemap_mode = false; // Exit treemap mode
                                             }
                                         }
                                         self.g_pressed = false;
@@ -648,7 +623,7 @@ impl App {
                                         self.treemap_mode = !self.treemap_mode;
                                         if self.treemap_mode {
                                             // Initialize treemap for current path
-                                            self.treemap_selected = 0;
+                                            // The selection is already set in file_list_state
                                             if let Some(selected) = self.file_list_state.selected()
                                             {
                                                 let visible = self.get_visible_entries();
@@ -658,10 +633,10 @@ impl App {
 
                                                     self.treemap_path = entry_path.clone();
 
-                                                    // If it's a directory, unfold it to ensure children are loaded
+                                                    // If it's a directory, ensure children are loaded
                                                     if entry_is_dir {
                                                         if let Err(e) = self
-                                                            .unfold_directory_by_path(&entry_path)
+                                                            .ensure_children_loaded(&entry_path)
                                                             .await
                                                         {
                                                             self.status_message = format!(
@@ -1701,51 +1676,35 @@ impl App {
     fn render_file_info(&self, f: &mut Frame, area: Rect) {
         let info_text = if self.treemap_mode {
             // In treemap mode, show info for the selected treemap item
-            let all_entries = self.get_visible_entries();
-            let current_entries: Vec<StoredFileEntry> = if self.treemap_path.is_empty() {
-                all_entries
-                    .into_iter()
-                    .filter(|e| e.depth == 0)
-                    .map(|e| e.clone())
-                    .collect()
-            } else {
-                all_entries
-                    .into_iter()
-                    .filter(|e| {
-                        if let Some(ref parent) = e.parent_path {
-                            parent == &self.treemap_path
-                        } else {
-                            false
-                        }
-                    })
-                    .map(|e| e.clone())
-                    .collect()
-            };
+            let treemap_entries = self.get_treemap_entries();
+            if let Some(treemap_idx) = self.get_treemap_selection() {
+                if let Some(entry) = treemap_entries.get(treemap_idx) {
+                    let file_type = if entry.is_dir { "Directory" } else { "File" }.to_string();
+                    let size_str = format_size(entry.size as u64);
+                    let name = entry.name.clone();
+                    let path = entry.path.clone();
 
-            if let Some(entry) = current_entries.get(self.treemap_selected) {
-                let file_type = if entry.is_dir { "Directory" } else { "File" }.to_string();
-                let size_str = format_size(entry.size as u64);
-                let name = entry.name.clone();
-                let path = entry.path.clone();
-
-                vec![
-                    Line::from(vec![
-                        Span::styled("Type: ", Style::default().fg(Color::Yellow)),
-                        Span::raw(file_type),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Name: ", Style::default().fg(Color::Yellow)),
-                        Span::raw(name),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Path: ", Style::default().fg(Color::Yellow)),
-                        Span::raw(path),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Size: ", Style::default().fg(Color::Yellow)),
-                        Span::raw(size_str),
-                    ]),
-                ]
+                    vec![
+                        Line::from(vec![
+                            Span::styled("Type: ", Style::default().fg(Color::Yellow)),
+                            Span::raw(file_type),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("Name: ", Style::default().fg(Color::Yellow)),
+                            Span::raw(name),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("Path: ", Style::default().fg(Color::Yellow)),
+                            Span::raw(path),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("Size: ", Style::default().fg(Color::Yellow)),
+                            Span::raw(size_str),
+                        ]),
+                    ]
+                } else {
+                    vec![Line::from("No file selected")]
+                }
             } else {
                 vec![Line::from("No file selected")]
             }
@@ -1955,13 +1914,31 @@ impl App {
             return;
         }
 
-        // Build treemap
-        let treemap_rects = treemap::build_treemap(&current_entries, area, 0);
+        // Create outer block with title showing current path
+        let title = format!(
+            "Treemap: {} | T: exit | o/Enter: drill down | u/Esc: up | hjkl/arrows: navigate",
+            if self.treemap_path.is_empty() {
+                if let Some(scan) = &self.current_scan {
+                    scan.root_path.as_str()
+                } else {
+                    "/"
+                }
+            } else {
+                &self.treemap_path
+            }
+        );
+        let outer_block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner_area = outer_block.inner(area);
+        f.render_widget(outer_block, area);
 
-        // Ensure selected index is in range
-        if self.treemap_selected >= treemap_rects.len() {
-            self.treemap_selected = treemap_rects.len().saturating_sub(1);
-        }
+        // Build treemap in the inner area
+        let treemap_rects = treemap::build_treemap(&current_entries, inner_area, 0);
+
+        // Get current selection index
+        let selected_idx = self.get_treemap_selection();
 
         // Color palette for different depths
         let colors = [
@@ -1984,7 +1961,7 @@ impl App {
                 continue;
             }
 
-            let is_selected = idx == self.treemap_selected;
+            let is_selected = selected_idx == Some(idx);
             // Use index instead of depth for colors so each item gets a different color
             let color = colors[idx % colors.len()];
             let size_str = format_size(treemap_rect.entry.size as u64);
@@ -2769,26 +2746,136 @@ impl App {
         Ok(())
     }
 
-    async fn unfold_directory_by_path(&mut self, dir_path: &str) -> Result<()> {
-        // Helper method to unfold a specific directory and load its children
-        if !self.folded_dirs.contains(dir_path) {
-            // Already unfolded
-            return Ok(());
+    /// Get the entries visible at the current treemap level
+    fn get_treemap_entries(&self) -> Vec<StoredFileEntry> {
+        let all_entries = self.get_visible_entries();
+        if self.treemap_path.is_empty() {
+            all_entries
+                .into_iter()
+                .filter(|e| e.depth == 0)
+                .map(|e| e.clone())
+                .collect()
+        } else {
+            all_entries
+                .into_iter()
+                .filter(|e| {
+                    if let Some(ref parent) = e.parent_path {
+                        parent == &self.treemap_path
+                    } else {
+                        false
+                    }
+                })
+                .map(|e| e.clone())
+                .collect()
+        }
+    }
+
+    /// Get the currently selected treemap entry index (into treemap entries, not full list)
+    fn get_treemap_selection(&self) -> Option<usize> {
+        // In treemap mode, we track selection via the global file_list_state
+        // but interpret it relative to the treemap entries
+        let treemap_entries = self.get_treemap_entries();
+        if treemap_entries.is_empty() {
+            return None;
         }
 
-        // Check if children are already loaded
+        // If we have a global selection, find which treemap entry it corresponds to
+        if let Some(global_idx) = self.file_list_state.selected() {
+            let visible = self.get_visible_entries();
+            if let Some(selected_entry) = visible.get(global_idx) {
+                // Find this entry in treemap entries
+                if let Some(treemap_idx) = treemap_entries
+                    .iter()
+                    .position(|e| e.path == selected_entry.path)
+                {
+                    return Some(treemap_idx);
+                }
+            }
+        }
+
+        // Default to first entry if nothing selected or not in treemap
+        Some(0)
+    }
+
+    /// Set the treemap selection (updates global file_list_state)
+    fn set_treemap_selection(&mut self, treemap_idx: usize) {
+        let treemap_entries = self.get_treemap_entries();
+        if let Some(entry) = treemap_entries.get(treemap_idx) {
+            // Find this entry in the visible list and select it
+            let visible = self.get_visible_entries();
+            if let Some(global_idx) = visible.iter().position(|e| e.path == entry.path) {
+                self.file_list_state.select(Some(global_idx));
+            }
+        }
+    }
+
+    /// Navigate treemap selection by offset
+    fn navigate_treemap_selection(&mut self, offset: isize) {
+        let treemap_entries = self.get_treemap_entries();
+        if treemap_entries.is_empty() {
+            return;
+        }
+
+        let current = self.get_treemap_selection().unwrap_or(0);
+        let new_idx = if offset < 0 {
+            current.saturating_sub(offset.unsigned_abs())
+        } else {
+            current.saturating_add(offset as usize)
+        };
+        let clamped = new_idx.min(treemap_entries.len() - 1);
+        self.set_treemap_selection(clamped);
+    }
+
+    async fn ensure_children_loaded(&mut self, dir_path: &str) -> Result<()> {
+        // Ensure children are loaded for treemap - always loads from DB if not in memory
+        // This is independent of fold state - treemap doesn't care about folding
         let children_already_loaded = self.file_entries.iter().any(|e| {
-            e.path.starts_with(&format!("{}/", dir_path))
-                || (e.path.len() > dir_path.len()
-                    && e.path.starts_with(dir_path)
-                    && e.path.as_bytes().get(dir_path.len()) == Some(&b'/'))
+            if let Some(ref parent) = e.parent_path {
+                parent == dir_path
+            } else {
+                false
+            }
+        });
+
+        if !children_already_loaded {
+            // Load children from database for treemap
+            if let Some(scan) = &self.current_scan {
+                let scan_id = scan.id;
+                let db = self.db.clone();
+                let parent_path = dir_path.to_string();
+
+                let task = tokio::spawn(async move {
+                    let entries = db
+                        .get_entries_by_parent(scan_id, Some(&parent_path))
+                        .await?;
+                    Ok(LoadingResult::DirectoryChildren(parent_path, entries))
+                });
+
+                self.loading_task = Some(task);
+                self.loading_path = Some(dir_path.to_string());
+                self.loading_throbber_frame = 0;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn unfold_directory_by_path(&mut self, dir_path: &str) -> Result<()> {
+        // Helper method to unfold a specific directory (for file tree view)
+        // Check if children are loaded
+        let children_already_loaded = self.file_entries.iter().any(|e| {
+            if let Some(ref parent) = e.parent_path {
+                parent == dir_path
+            } else {
+                false
+            }
         });
 
         if children_already_loaded {
-            // Just unfold
+            // Children already exist in memory, just unfold
             self.folded_dirs.remove(dir_path);
         } else {
-            // Need to load from database
+            // Need to load children from database
             if let Some(scan) = &self.current_scan {
                 let scan_id = scan.id;
                 let db = self.db.clone();
