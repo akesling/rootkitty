@@ -270,6 +270,11 @@ impl App {
                                 self.toggle_scan_tree_fold();
                                 self.g_pressed = false;
                             }
+                            KeyCode::Char('Z') => {
+                                // Unfold all (recursively expand everything)
+                                self.unfold_all_scan_tree();
+                                self.g_pressed = false;
+                            }
                             KeyCode::Char('o') => {
                                 // Open scan if ScanNode, or toggle fold if PathNode
                                 if let Some(selected_index) = self.scan_list_state.selected() {
@@ -289,6 +294,11 @@ impl App {
                                         }
                                     }
                                 }
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('O') => {
+                                // Unfold all (recursively expand everything)
+                                self.unfold_all_scan_tree();
                                 self.g_pressed = false;
                             }
                             KeyCode::Char('x') => {
@@ -1380,8 +1390,8 @@ impl App {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
-                    .title("Scans (1) | o/Enter: open | z: fold/unfold | r: resume | n: new | ↑/↓ or j/k: navigate")
+                    .borders(Borders::NONE)
+                    .title("Scans (1) | o/Enter: open | z: fold/unfold | r: resume | n: new | j/k: navigate")
                     .title_top(
                         Line::from(format!(" DB: {} ", db_size_str))
                             .right_aligned()
@@ -2049,7 +2059,7 @@ impl App {
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
         let help_text = match self.view {
             View::ScanList => {
-                "q: quit | n: new | t: toggle sort | S: settings | 1: scans | 2: files | 3: cleanup"
+                "n: new | ?: help"
             }
             View::FileTree => {
                 "q: quit | t: toggle sort | s: shell | Space: mark | z: fold | ↑↓/jk: navigate"
@@ -2820,6 +2830,12 @@ impl App {
                 self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
             }
         }
+    }
+
+    /// Unfold all nodes in the scan tree (expand everything)
+    fn unfold_all_scan_tree(&mut self) {
+        scan_tree::unfold_all(&mut self.scan_tree);
+        self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
     }
 
     /// Get the display path for a scan, clipping the parent path if the scan is nested

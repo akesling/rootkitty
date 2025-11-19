@@ -398,6 +398,22 @@ fn unfold_recursive(nodes: &mut [ScanTreeNode], path: &str) -> bool {
     false
 }
 
+/// Unfold all nodes in the tree (recursively expand everything)
+pub fn unfold_all(tree: &mut [ScanTreeNode]) {
+    unfold_all_recursive(tree);
+}
+
+fn unfold_all_recursive(nodes: &mut [ScanTreeNode]) {
+    for node in nodes.iter_mut() {
+        node.set_folded(false);
+
+        // Recurse into children
+        if let Some(children) = node.children_mut() {
+            unfold_all_recursive(children);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

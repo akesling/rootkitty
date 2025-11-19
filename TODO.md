@@ -21,3 +21,4 @@
 * Move this task list to Chox + chox-tui
 * Shortcuts at the bottom of the screen extend off the right side / are cut off.
 * Shortcuts page should be scrollable
+* Make SHIFT+Z and SHIFT+O open up all nested scans
