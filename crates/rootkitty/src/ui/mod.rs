@@ -1867,30 +1867,8 @@ impl App {
     }
 
     fn render_treemap_interactive(&mut self, f: &mut Frame, area: Rect) {
-        // Filter entries by current treemap path - only direct children
-        let all_entries = self.get_visible_entries();
-        let current_entries: Vec<StoredFileEntry> = if self.treemap_path.is_empty() {
-            // Show top level entries
-            all_entries
-                .into_iter()
-                .filter(|e| e.depth == 0)
-                .map(|e| e.clone())
-                .collect()
-        } else {
-            // Show only direct children of treemap_path (not all descendants)
-            // Direct children have parent_path == treemap_path
-            all_entries
-                .into_iter()
-                .filter(|e| {
-                    if let Some(ref parent) = e.parent_path {
-                        parent == &self.treemap_path
-                    } else {
-                        false
-                    }
-                })
-                .map(|e| e.clone())
-                .collect()
-        };
+        // Get entries at current treemap level (uses get_treemap_entries helper)
+        let current_entries = self.get_treemap_entries();
 
         if current_entries.is_empty() {
             let text = vec![
@@ -2748,16 +2726,17 @@ impl App {
 
     /// Get the entries visible at the current treemap level
     fn get_treemap_entries(&self) -> Vec<StoredFileEntry> {
-        let all_entries = self.get_visible_entries();
+        // Use ALL entries in memory, not just visible (unfolded) ones
+        // Treemap should show all children regardless of file tree fold state
         if self.treemap_path.is_empty() {
-            all_entries
-                .into_iter()
+            self.file_entries
+                .iter()
                 .filter(|e| e.depth == 0)
-                .map(|e| e.clone())
+                .cloned()
                 .collect()
         } else {
-            all_entries
-                .into_iter()
+            self.file_entries
+                .iter()
                 .filter(|e| {
                     if let Some(ref parent) = e.parent_path {
                         parent == &self.treemap_path
@@ -2765,7 +2744,7 @@ impl App {
                         false
                     }
                 })
-                .map(|e| e.clone())
+                .cloned()
                 .collect()
         }
     }
@@ -2801,10 +2780,16 @@ impl App {
     fn set_treemap_selection(&mut self, treemap_idx: usize) {
         let treemap_entries = self.get_treemap_entries();
         if let Some(entry) = treemap_entries.get(treemap_idx) {
-            // Find this entry in the visible list and select it
+            // Find this entry in the visible file tree list
             let visible = self.get_visible_entries();
             if let Some(global_idx) = visible.iter().position(|e| e.path == entry.path) {
                 self.file_list_state.select(Some(global_idx));
+            } else {
+                // Entry not in visible list (folded in file tree), but we still want to track it
+                // Just select the first visible entry as a fallback
+                if !visible.is_empty() {
+                    self.file_list_state.select(Some(0));
+                }
             }
         }
     }
@@ -2838,22 +2823,27 @@ impl App {
         });
 
         if !children_already_loaded {
-            // Load children from database for treemap
+            // Load children from database for treemap - wait for completion
             if let Some(scan) = &self.current_scan {
                 let scan_id = scan.id;
                 let db = self.db.clone();
                 let parent_path = dir_path.to_string();
 
-                let task = tokio::spawn(async move {
-                    let entries = db
-                        .get_entries_by_parent(scan_id, Some(&parent_path))
-                        .await?;
-                    Ok(LoadingResult::DirectoryChildren(parent_path, entries))
-                });
+                // Load directly and wait for completion
+                let children = db
+                    .get_entries_by_parent(scan_id, Some(&parent_path))
+                    .await?;
 
-                self.loading_task = Some(task);
-                self.loading_path = Some(dir_path.to_string());
-                self.loading_throbber_frame = 0;
+                // Add children to file_entries if not already there
+                for child in children {
+                    if !self.file_entries.iter().any(|e| e.path == child.path) {
+                        // Fold directories by default
+                        if child.is_dir {
+                            self.folded_dirs.insert(child.path.clone());
+                        }
+                        self.file_entries.push(child);
+                    }
+                }
             }
         }
 
@@ -4470,6 +4460,287 @@ mod tests {
         assert!(
             a_idx < file1_idx,
             "Directory /root/a should appear before /root/a/file1.txt"
+        );
+    }
+
+    // Helper function to create an App for testing
+    fn create_test_app(db: Database) -> App {
+        use std::path::PathBuf;
+        App::new(
+            db,
+            Settings::default(),
+            PathBuf::from("/tmp/test_settings.toml"),
+            PathBuf::from("/tmp/test_db.db"),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_get_treemap_entries_root_level() {
+        let db = Database::new(":memory:").await.unwrap();
+        let mut app = create_test_app(db);
+
+        // Create test entries at root level
+        app.file_entries = vec![
+            StoredFileEntry {
+                id: 1,
+                scan_id: 1,
+                path: "/root".to_string(),
+                name: "root".to_string(),
+                size: 1000,
+                is_dir: true,
+                depth: 0,
+                parent_path: None,
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 2,
+                scan_id: 1,
+                path: "/root/child1".to_string(),
+                name: "child1".to_string(),
+                size: 500,
+                is_dir: true,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 3,
+                scan_id: 1,
+                path: "/root/child2".to_string(),
+                name: "child2".to_string(),
+                size: 300,
+                is_dir: false,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+        ];
+
+        // Test: at root level, should only return depth 0 entries
+        app.treemap_path = String::new();
+        let entries = app.get_treemap_entries();
+        assert_eq!(entries.len(), 1, "Should have 1 entry at root level");
+        assert_eq!(entries[0].name, "root");
+    }
+
+    #[tokio::test]
+    async fn test_get_treemap_entries_subdirectory() {
+        let db = Database::new(":memory:").await.unwrap();
+        let mut app = create_test_app(db);
+
+        // Create test entries
+        app.file_entries = vec![
+            StoredFileEntry {
+                id: 1,
+                scan_id: 1,
+                path: "/root".to_string(),
+                name: "root".to_string(),
+                size: 1000,
+                is_dir: true,
+                depth: 0,
+                parent_path: None,
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 2,
+                scan_id: 1,
+                path: "/root/child1".to_string(),
+                name: "child1".to_string(),
+                size: 500,
+                is_dir: true,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 3,
+                scan_id: 1,
+                path: "/root/child2".to_string(),
+                name: "child2".to_string(),
+                size: 300,
+                is_dir: false,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 4,
+                scan_id: 1,
+                path: "/root/child1/grandchild".to_string(),
+                name: "grandchild".to_string(),
+                size: 100,
+                is_dir: false,
+                depth: 2,
+                parent_path: Some("/root/child1".to_string()),
+                modified_at: None,
+            },
+        ];
+
+        // Test: at /root level, should return child1 and child2 (not grandchild)
+        app.treemap_path = "/root".to_string();
+        let entries = app.get_treemap_entries();
+        assert_eq!(entries.len(), 2, "Should have 2 direct children of /root");
+        assert!(entries.iter().any(|e| e.name == "child1"));
+        assert!(entries.iter().any(|e| e.name == "child2"));
+        assert!(!entries.iter().any(|e| e.name == "grandchild"));
+    }
+
+    #[tokio::test]
+    async fn test_get_treemap_entries_ignores_fold_state() {
+        let db = Database::new(":memory:").await.unwrap();
+        let mut app = create_test_app(db);
+
+        // Create test entries
+        app.file_entries = vec![
+            StoredFileEntry {
+                id: 1,
+                scan_id: 1,
+                path: "/root".to_string(),
+                name: "root".to_string(),
+                size: 1000,
+                is_dir: true,
+                depth: 0,
+                parent_path: None,
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 2,
+                scan_id: 1,
+                path: "/root/child1".to_string(),
+                name: "child1".to_string(),
+                size: 500,
+                is_dir: true,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+        ];
+
+        // Fold /root in the file tree
+        app.folded_dirs.insert("/root".to_string());
+
+        // Test: treemap should still show children even when parent is folded
+        app.treemap_path = "/root".to_string();
+        let entries = app.get_treemap_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "Should have 1 child even though parent is folded in file tree"
+        );
+        assert_eq!(entries[0].name, "child1");
+    }
+
+    #[tokio::test]
+    async fn test_treemap_selection_navigation() {
+        let db = Database::new(":memory:").await.unwrap();
+        let mut app = create_test_app(db);
+
+        // Create test entries at /root level
+        app.file_entries = vec![
+            StoredFileEntry {
+                id: 1,
+                scan_id: 1,
+                path: "/root".to_string(),
+                name: "root".to_string(),
+                size: 1000,
+                is_dir: true,
+                depth: 0,
+                parent_path: None,
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 2,
+                scan_id: 1,
+                path: "/root/a".to_string(),
+                name: "a".to_string(),
+                size: 300,
+                is_dir: false,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 3,
+                scan_id: 1,
+                path: "/root/b".to_string(),
+                name: "b".to_string(),
+                size: 400,
+                is_dir: false,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+            StoredFileEntry {
+                id: 4,
+                scan_id: 1,
+                path: "/root/c".to_string(),
+                name: "c".to_string(),
+                size: 300,
+                is_dir: false,
+                depth: 1,
+                parent_path: Some("/root".to_string()),
+                modified_at: None,
+            },
+        ];
+
+        app.treemap_path = "/root".to_string();
+
+        // Initially select first entry (a)
+        app.set_treemap_selection(0);
+        let sel = app.get_treemap_selection();
+        assert_eq!(sel, Some(0), "Should select first entry");
+
+        // Navigate forward
+        app.navigate_treemap_selection(1);
+        let sel = app.get_treemap_selection();
+        assert_eq!(sel, Some(1), "Should select second entry");
+
+        // Navigate forward again
+        app.navigate_treemap_selection(1);
+        let sel = app.get_treemap_selection();
+        assert_eq!(sel, Some(2), "Should select third entry");
+
+        // Navigate backward
+        app.navigate_treemap_selection(-1);
+        let sel = app.get_treemap_selection();
+        assert_eq!(sel, Some(1), "Should select second entry again");
+
+        // Navigate beyond bounds (should clamp)
+        app.navigate_treemap_selection(10);
+        let sel = app.get_treemap_selection();
+        assert_eq!(sel, Some(2), "Should clamp to last entry");
+
+        // Navigate backward beyond bounds (should clamp)
+        app.navigate_treemap_selection(-10);
+        let sel = app.get_treemap_selection();
+        assert_eq!(sel, Some(0), "Should clamp to first entry");
+    }
+
+    #[tokio::test]
+    async fn test_treemap_entries_empty_when_no_children() {
+        let db = Database::new(":memory:").await.unwrap();
+        let mut app = create_test_app(db);
+
+        // Create test entries - /root exists but has no children in memory
+        app.file_entries = vec![StoredFileEntry {
+            id: 1,
+            scan_id: 1,
+            path: "/root".to_string(),
+            name: "root".to_string(),
+            size: 1000,
+            is_dir: true,
+            depth: 0,
+            parent_path: None,
+            modified_at: None,
+        }];
+
+        // Test: /root has no children in memory
+        app.treemap_path = "/root".to_string();
+        let entries = app.get_treemap_entries();
+        assert_eq!(
+            entries.len(),
+            0,
+            "Should have 0 entries when children not loaded"
         );
     }
 }
