@@ -116,6 +116,10 @@ pub struct App {
     treemap_mode: bool,
     /// Current path being viewed in treemap
     treemap_path: String,
+    /// Scroll offset for treemap list view (which item is at the top)
+    treemap_scroll_offset: usize,
+    /// Independent selection index for treemap (index into treemap entries)
+    treemap_selection: usize,
     /// File entry being viewed in detail
     detail_file: Option<StoredFileEntry>,
 }
@@ -167,6 +171,8 @@ impl App {
             flat_scan_tree: Vec::new(),
             treemap_mode: false,
             treemap_path: String::from("/"),
+            treemap_scroll_offset: 0,
+            treemap_selection: 0,
             detail_file: None,
         }
     }
@@ -393,7 +399,7 @@ impl App {
                                 // Treemap navigation
                                 match key.code {
                                     KeyCode::Char('q') => return Ok(()),
-                                    KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('u') => {
+                                    KeyCode::Esc | KeyCode::Backspace => {
                                         // Exit treemap mode or go up one level
                                         if self.treemap_path.is_empty() {
                                             // Already at root, exit treemap mode
@@ -413,6 +419,7 @@ impl App {
                                             } else {
                                                 self.treemap_path.clear();
                                             }
+                                            self.treemap_scroll_offset = 0;
                                             self.set_treemap_selection(0);
                                             self.status_message = format!(
                                                 "Treemap path: {}",
@@ -429,6 +436,16 @@ impl App {
                                         // Toggle treemap mode off
                                         self.treemap_mode = false;
                                         self.status_message = "Exited treemap mode".to_string();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('g') => {
+                                        // 'gg' - go to top
+                                        self.treemap_goto_top();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('G') => {
+                                        // Shift+G - go to bottom
+                                        self.treemap_goto_bottom();
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Down | KeyCode::Char('j') => {
@@ -449,6 +466,16 @@ impl App {
                                     KeyCode::Left | KeyCode::Char('h') => {
                                         // Previous rectangle (same as up for now)
                                         self.navigate_treemap_selection(-1);
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('d') => {
+                                        // Page down
+                                        self.treemap_page_down();
+                                        self.g_pressed = false;
+                                    }
+                                    KeyCode::Char('u') => {
+                                        // Page up
+                                        self.treemap_page_up();
                                         self.g_pressed = false;
                                     }
                                     KeyCode::Enter | KeyCode::Char('o') => {
@@ -473,6 +500,7 @@ impl App {
                                                     }
 
                                                     self.treemap_path = dir_path;
+                                                    self.treemap_scroll_offset = 0;
                                                     self.set_treemap_selection(0);
                                                     self.status_message = format!(
                                                         "Treemap path: {}",
@@ -632,6 +660,8 @@ impl App {
                                                     let entry_is_dir = entry.is_dir;
 
                                                     self.treemap_path = entry_path.clone();
+                                                    self.treemap_scroll_offset = 0;
+                                                    self.set_treemap_selection(0);
 
                                                     // If it's a directory, ensure children are loaded
                                                     if entry_is_dir {
@@ -1892,9 +1922,16 @@ impl App {
             return;
         }
 
-        // Create outer block with title showing current path
+        // Split the area: top 60% for visual treemap, bottom 40% for scrollable list
+        use ratatui::layout::{Constraint, Direction, Layout};
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+
+        // === Top section: Visual Treemap ===
         let title = format!(
-            "Treemap: {} | T: exit | o/Enter: drill down | u/Esc: up | hjkl/arrows: navigate",
+            "Treemap: {} | T: exit | o/Enter: drill | Esc: up | gg/G: top/bottom | u/d: page up/down | hjkl: navigate",
             if self.treemap_path.is_empty() {
                 if let Some(scan) = &self.current_scan {
                     scan.root_path.as_str()
@@ -1909,8 +1946,8 @@ impl App {
             .borders(Borders::ALL)
             .title(title)
             .border_style(Style::default().fg(Color::Cyan));
-        let inner_area = outer_block.inner(area);
-        f.render_widget(outer_block, area);
+        let inner_area = outer_block.inner(chunks[0]);
+        f.render_widget(outer_block, chunks[0]);
 
         // Build treemap in the inner area
         let treemap_rects = treemap::build_treemap(&current_entries, inner_area, 0);
@@ -1930,12 +1967,12 @@ impl App {
             Color::LightGreen,
         ];
 
-        // Render using blocks for each rectangle
+        // Render using blocks for each rectangle (keep all, including tiny ones for selection)
         for (idx, treemap_rect) in treemap_rects.iter().enumerate() {
             let rect = treemap_rect.rect;
 
-            // Skip tiny rectangles
-            if rect.width < 3 || rect.height < 2 {
+            // Only skip rectangles with zero area
+            if rect.width == 0 || rect.height == 0 {
                 continue;
             }
 
@@ -1945,7 +1982,7 @@ impl App {
             let size_str = format_size(treemap_rect.entry.size as u64);
 
             // For larger rectangles, show name and size
-            let title =
+            let title = if rect.width >= 3 && rect.height >= 2 {
                 if rect.width > size_str.len() as u16 + treemap_rect.entry.name.len() as u16 + 5 {
                     format!("{} ({})", treemap_rect.entry.name, size_str)
                 } else if rect.width > treemap_rect.entry.name.len() as u16 + 2 {
@@ -1954,38 +1991,125 @@ impl App {
                     size_str.clone()
                 } else {
                     String::new()
-                };
-
-            // Use white text on colored backgrounds for better visibility
-            let mut style = Style::default().bg(color).fg(Color::White);
-            let mut border_style = Style::default().fg(color);
-
-            if is_selected {
-                // Highlight selected rectangle with bright white border
-                border_style = border_style.fg(Color::White).add_modifier(Modifier::BOLD);
-                style = style.add_modifier(Modifier::BOLD);
-            }
-
-            // Create styled title with white text and bold
-            let styled_title = if !title.is_empty() {
-                Line::from(vec![Span::styled(
-                    title,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )])
+                }
             } else {
-                Line::from("")
+                String::new()
             };
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(styled_title)
-                .style(style);
+            // Use white text on colored backgrounds for better visibility
+            let (style, border_style, styled_title) = if is_selected {
+                // Selected item: bright yellow background with black text for maximum contrast
+                let sel_style = Style::default()
+                    .bg(Color::Yellow)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD);
+                let sel_border_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
 
-            f.render_widget(block, rect);
+                let sel_title = if !title.is_empty() {
+                    Line::from(vec![Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    )])
+                } else {
+                    Line::from("")
+                };
+
+                (sel_style, sel_border_style, sel_title)
+            } else {
+                // Unselected items: colored backgrounds with white text
+                let norm_style = Style::default().bg(color).fg(Color::White);
+                let norm_border_style = Style::default().fg(color);
+
+                let norm_title = if !title.is_empty() {
+                    Line::from(vec![Span::styled(
+                        title,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )])
+                } else {
+                    Line::from("")
+                };
+
+                (norm_style, norm_border_style, norm_title)
+            };
+
+            // Only render blocks for rectangles that are large enough to see
+            if rect.width >= 2 && rect.height >= 1 {
+                let block = Block::default()
+                    .borders(if rect.width >= 3 && rect.height >= 2 {
+                        Borders::ALL
+                    } else {
+                        Borders::NONE
+                    })
+                    .border_style(border_style)
+                    .title(styled_title)
+                    .style(style);
+
+                f.render_widget(block, rect);
+            }
         }
+
+        // === Bottom section: Scrollable List of ALL entries ===
+        let list_title = format!("All Files ({} items)", current_entries.len());
+        let list_block = Block::default()
+            .borders(Borders::ALL)
+            .title(list_title)
+            .border_style(Style::default().fg(Color::Yellow));
+        let list_inner = list_block.inner(chunks[1]);
+        f.render_widget(list_block, chunks[1]);
+
+        // Calculate how many items we can show
+        let visible_items = list_inner.height as usize;
+
+        // Ensure scroll offset is valid
+        if self.treemap_scroll_offset >= current_entries.len() {
+            self.treemap_scroll_offset = current_entries.len().saturating_sub(1);
+        }
+
+        // Adjust scroll offset to keep selected item visible
+        if let Some(sel_idx) = selected_idx {
+            if sel_idx < self.treemap_scroll_offset {
+                self.treemap_scroll_offset = sel_idx;
+            } else if sel_idx >= self.treemap_scroll_offset + visible_items {
+                self.treemap_scroll_offset = sel_idx.saturating_sub(visible_items - 1);
+            }
+        }
+
+        // Create list items
+        let list_items: Vec<Line> = current_entries
+            .iter()
+            .enumerate()
+            .skip(self.treemap_scroll_offset)
+            .take(visible_items)
+            .map(|(idx, entry)| {
+                let is_selected = selected_idx == Some(idx);
+                let size_str = format_size(entry.size as u64);
+                let icon = if entry.is_dir { "📁" } else { "📄" };
+
+                // Format: icon name (size)
+                let text = format!("{} {} ({})", icon, entry.name, size_str);
+
+                if is_selected {
+                    Line::from(vec![Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )])
+                } else {
+                    Line::from(text)
+                }
+            })
+            .collect();
+
+        let paragraph = Paragraph::new(list_items);
+        f.render_widget(paragraph, list_inner);
     }
 
     fn render_file_detail(&self, f: &mut Frame, area: Rect) {
@@ -2845,46 +2969,27 @@ impl App {
 
     /// Get the currently selected treemap entry index (into treemap entries, not full list)
     fn get_treemap_selection(&self) -> Option<usize> {
-        // In treemap mode, we track selection via the global file_list_state
-        // but interpret it relative to the treemap entries
+        // Use independent treemap selection, not file_list_state
         let treemap_entries = self.get_treemap_entries();
         if treemap_entries.is_empty() {
             return None;
         }
 
-        // If we have a global selection, find which treemap entry it corresponds to
-        if let Some(global_idx) = self.file_list_state.selected() {
-            let visible = self.get_visible_entries();
-            if let Some(selected_entry) = visible.get(global_idx) {
-                // Find this entry in treemap entries
-                if let Some(treemap_idx) = treemap_entries
-                    .iter()
-                    .position(|e| e.path == selected_entry.path)
-                {
-                    return Some(treemap_idx);
-                }
-            }
+        // Ensure selection is within bounds
+        if self.treemap_selection < treemap_entries.len() {
+            Some(self.treemap_selection)
+        } else {
+            // Selection out of bounds, return last valid index
+            Some(treemap_entries.len() - 1)
         }
-
-        // Default to first entry if nothing selected or not in treemap
-        Some(0)
     }
 
-    /// Set the treemap selection (updates global file_list_state)
+    /// Set the treemap selection (independent of file tree state)
     fn set_treemap_selection(&mut self, treemap_idx: usize) {
         let treemap_entries = self.get_treemap_entries();
-        if let Some(entry) = treemap_entries.get(treemap_idx) {
-            // Find this entry in the visible file tree list
-            let visible = self.get_visible_entries();
-            if let Some(global_idx) = visible.iter().position(|e| e.path == entry.path) {
-                self.file_list_state.select(Some(global_idx));
-            } else {
-                // Entry not in visible list (folded in file tree), but we still want to track it
-                // Just select the first visible entry as a fallback
-                if !visible.is_empty() {
-                    self.file_list_state.select(Some(0));
-                }
-            }
+        if !treemap_entries.is_empty() {
+            // Clamp to valid range
+            self.treemap_selection = treemap_idx.min(treemap_entries.len() - 1);
         }
     }
 
@@ -2903,6 +3008,47 @@ impl App {
         };
         let clamped = new_idx.min(treemap_entries.len() - 1);
         self.set_treemap_selection(clamped);
+    }
+
+    fn treemap_goto_top(&mut self) {
+        let treemap_entries = self.get_treemap_entries();
+        if !treemap_entries.is_empty() {
+            self.set_treemap_selection(0);
+        }
+    }
+
+    fn treemap_goto_bottom(&mut self) {
+        let treemap_entries = self.get_treemap_entries();
+        if !treemap_entries.is_empty() {
+            self.set_treemap_selection(treemap_entries.len() - 1);
+        }
+    }
+
+    fn treemap_page_down(&mut self) {
+        let treemap_entries = self.get_treemap_entries();
+        if treemap_entries.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let current = self.get_treemap_selection().unwrap_or(0);
+        let new_idx = current + page_size;
+        let clamped = if new_idx >= treemap_entries.len() {
+            treemap_entries.len() - 1
+        } else {
+            new_idx
+        };
+        self.set_treemap_selection(clamped);
+    }
+
+    fn treemap_page_up(&mut self) {
+        let treemap_entries = self.get_treemap_entries();
+        if treemap_entries.is_empty() {
+            return;
+        }
+        let page_size = 10;
+        let current = self.get_treemap_selection().unwrap_or(0);
+        let new_idx = current.saturating_sub(page_size);
+        self.set_treemap_selection(new_idx);
     }
 
     async fn ensure_children_loaded(&mut self, dir_path: &str) -> Result<()> {
