@@ -2169,7 +2169,9 @@ impl App {
                 // Stats header
                 lines.push(Line::from(vec![Span::styled(
                     "Scan Statistics:",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 )]));
 
                 // Files and directories
@@ -3564,7 +3566,8 @@ impl App {
                 // Keep selection at same index if possible, otherwise clamp
                 if selected_index >= self.flat_scan_tree.len() {
                     if !self.flat_scan_tree.is_empty() {
-                        self.scan_list_state.select(Some(self.flat_scan_tree.len() - 1));
+                        self.scan_list_state
+                            .select(Some(self.flat_scan_tree.len() - 1));
                     } else {
                         self.scan_list_state.select(None);
                     }

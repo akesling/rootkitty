@@ -317,7 +317,11 @@ impl Database {
 
         // Reclaim disk space by running VACUUM
         // This rebuilds the database file, removing freed pages
-        sqlx::query("VACUUM")
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+
+        // Checkpoint and truncate the WAL file to reclaim disk space
+        // TRUNCATE mode merges WAL into main DB and then truncates WAL to zero bytes
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
             .await?;
 
@@ -613,6 +617,20 @@ impl Database {
         sqlx::query("DELETE FROM cleanup_items WHERE scan_id = ? AND entry_path = ?")
             .bind(scan_id)
             .bind(entry_path)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Compact the database by running VACUUM and checkpointing the WAL
+    /// This reclaims disk space from deleted data and shrinks the WAL file
+    pub async fn compact(&self) -> Result<()> {
+        // Rebuild database file to reclaim freed pages
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+
+        // Checkpoint and truncate the WAL file
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&self.pool)
             .await?;
 

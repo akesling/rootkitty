@@ -63,6 +63,8 @@ enum Commands {
         /// Second scan ID
         scan_id_2: i64,
     },
+    /// Compact the database (reclaim disk space from deleted scans)
+    Compact,
 }
 
 #[tokio::main]
@@ -394,6 +396,13 @@ async fn main() -> Result<()> {
                     println!("One or both scans not found");
                 }
             }
+        }
+        Some(Commands::Compact) => {
+            println!("Compacting database...");
+            println!("  Running VACUUM to reclaim freed space...");
+            db.compact().await?;
+            println!("✓ Database compacted successfully");
+            println!("  The database file and WAL have been optimized");
         }
     }
 

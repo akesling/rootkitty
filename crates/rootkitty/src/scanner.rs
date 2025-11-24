@@ -184,9 +184,12 @@ impl Scanner {
         self.scan_recursive(&self.root_path, 0, &total_size, &total_files, &total_dirs)?;
 
         // Store calculated stats for progress updates during final flush
-        self.calculated_total_size.store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.calculated_total_files.store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.calculated_total_dirs.store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_size
+            .store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_files
+            .store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_dirs
+            .store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
 
         // Final flush of any remaining buffered entries
         self.flush_buffer()?;
@@ -475,9 +478,12 @@ impl Scanner {
         total_size.store(final_size, Ordering::Relaxed);
 
         // Also store in the Scanner's fields for progress updates during streaming
-        self.calculated_total_size.store(final_size, Ordering::Relaxed);
-        self.calculated_total_files.store(final_files as u64, Ordering::Relaxed);
-        self.calculated_total_dirs.store(final_dirs as u64, Ordering::Relaxed);
+        self.calculated_total_size
+            .store(final_size, Ordering::Relaxed);
+        self.calculated_total_files
+            .store(final_files as u64, Ordering::Relaxed);
+        self.calculated_total_dirs
+            .store(final_dirs as u64, Ordering::Relaxed);
 
         // Check if cancelled before constructing FileEntry objects
         if self.cancelled.load(Ordering::Relaxed) {
@@ -736,9 +742,12 @@ impl Scanner {
         total_size.store(final_size, Ordering::Relaxed);
 
         // Also store in the Scanner's fields for progress updates during streaming
-        self.calculated_total_size.store(final_size, Ordering::Relaxed);
-        self.calculated_total_files.store(final_files as u64, Ordering::Relaxed);
-        self.calculated_total_dirs.store(final_dirs as u64, Ordering::Relaxed);
+        self.calculated_total_size
+            .store(final_size, Ordering::Relaxed);
+        self.calculated_total_files
+            .store(final_files as u64, Ordering::Relaxed);
+        self.calculated_total_dirs
+            .store(final_dirs as u64, Ordering::Relaxed);
 
         // Check if cancelled before constructing FileEntry objects
         if self.cancelled.load(Ordering::Relaxed) {
@@ -844,9 +853,12 @@ impl Scanner {
                 )?;
 
                 // Store calculated stats for progress updates during final flush
-                self.calculated_total_size.store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
-                self.calculated_total_files.store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
-                self.calculated_total_dirs.store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.calculated_total_size
+                    .store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.calculated_total_files
+                    .store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.calculated_total_dirs
+                    .store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
 
                 // Final flush of any remaining buffered entries
                 self.flush_buffer()?;
@@ -1298,9 +1310,12 @@ impl Scanner {
         }
 
         // Store calculated stats for progress updates during final flush
-        self.calculated_total_size.store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.calculated_total_files.store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.calculated_total_dirs.store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_size
+            .store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_files
+            .store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_dirs
+            .store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
 
         // Final flush
         self.flush_buffer()?;
