@@ -315,6 +315,12 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // Reclaim disk space by running VACUUM
+        // This rebuilds the database file, removing freed pages
+        sqlx::query("VACUUM")
+            .execute(&self.pool)
+            .await?;
+
         Ok(())
     }
 

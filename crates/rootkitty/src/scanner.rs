@@ -48,8 +48,10 @@ const PROGRESS_UPDATE_INTERVAL: u64 = 100; // Send progress every N entries
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScannerImpl {
     /// Custom rayon-based parallel implementation
+    #[allow(dead_code)]
     Custom,
     /// walkdir-based single-threaded implementation
+    #[allow(dead_code)]
     Walkdir,
     /// Hybrid: walkdir for traversal + rayon for parallelism
     Hybrid,
@@ -73,6 +75,12 @@ pub struct Scanner {
     implementation: ScannerImpl,
     /// Whether to follow symbolic links during scanning
     follow_symlinks: bool,
+    /// Calculated total size (updated after scan processing completes)
+    calculated_total_size: Arc<AtomicU64>,
+    /// Calculated total files (updated after scan processing completes)
+    calculated_total_files: Arc<AtomicU64>,
+    /// Calculated total dirs (updated after scan processing completes)
+    calculated_total_dirs: Arc<AtomicU64>,
 }
 
 impl Scanner {
@@ -95,6 +103,9 @@ impl Scanner {
             cancelled,
             implementation: ScannerImpl::Hybrid,
             follow_symlinks,
+            calculated_total_size: Arc::new(AtomicU64::new(0)),
+            calculated_total_files: Arc::new(AtomicU64::new(0)),
+            calculated_total_dirs: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -117,16 +128,21 @@ impl Scanner {
             cancelled,
             implementation: ScannerImpl::Hybrid,
             follow_symlinks,
+            calculated_total_size: Arc::new(AtomicU64::new(0)),
+            calculated_total_files: Arc::new(AtomicU64::new(0)),
+            calculated_total_dirs: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Simple constructor for benchmarking - collects entries in memory
     /// Uses the hybrid jwalk+rayon implementation by default
+    #[allow(dead_code)]
     pub fn new<P: AsRef<Path>>(root_path: P) -> Self {
         Self::new_with_impl(root_path, ScannerImpl::Custom)
     }
 
     /// Constructor for benchmarking with a specific implementation
+    #[allow(dead_code)]
     pub fn new_with_impl<P: AsRef<Path>>(root_path: P, implementation: ScannerImpl) -> Self {
         Self {
             root_path: root_path.as_ref().to_path_buf(),
@@ -140,6 +156,9 @@ impl Scanner {
             cancelled: Arc::new(AtomicBool::new(false)),
             implementation,
             follow_symlinks: false, // Default to false for benchmarks
+            calculated_total_size: Arc::new(AtomicU64::new(0)),
+            calculated_total_files: Arc::new(AtomicU64::new(0)),
+            calculated_total_dirs: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -163,6 +182,11 @@ impl Scanner {
         let total_dirs = AtomicU64::new(0);
 
         self.scan_recursive(&self.root_path, 0, &total_size, &total_files, &total_dirs)?;
+
+        // Store calculated stats for progress updates during final flush
+        self.calculated_total_size.store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_files.store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_dirs.store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
 
         // Final flush of any remaining buffered entries
         self.flush_buffer()?;
@@ -450,6 +474,11 @@ impl Scanner {
         total_dirs.store(final_dirs, Ordering::Relaxed);
         total_size.store(final_size, Ordering::Relaxed);
 
+        // Also store in the Scanner's fields for progress updates during streaming
+        self.calculated_total_size.store(final_size, Ordering::Relaxed);
+        self.calculated_total_files.store(final_files as u64, Ordering::Relaxed);
+        self.calculated_total_dirs.store(final_dirs as u64, Ordering::Relaxed);
+
         // Check if cancelled before constructing FileEntry objects
         if self.cancelled.load(Ordering::Relaxed) {
             return Err(anyhow::anyhow!("Scan cancelled"));
@@ -706,6 +735,11 @@ impl Scanner {
         total_dirs.store(final_dirs, Ordering::Relaxed);
         total_size.store(final_size, Ordering::Relaxed);
 
+        // Also store in the Scanner's fields for progress updates during streaming
+        self.calculated_total_size.store(final_size, Ordering::Relaxed);
+        self.calculated_total_files.store(final_files as u64, Ordering::Relaxed);
+        self.calculated_total_dirs.store(final_dirs as u64, Ordering::Relaxed);
+
         // Check if cancelled before constructing FileEntry objects
         if self.cancelled.load(Ordering::Relaxed) {
             return Err(anyhow::anyhow!("Scan cancelled"));
@@ -808,6 +842,11 @@ impl Scanner {
                     &total_dirs,
                     &scanned_paths,
                 )?;
+
+                // Store calculated stats for progress updates during final flush
+                self.calculated_total_size.store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.calculated_total_files.store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
+                self.calculated_total_dirs.store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
 
                 // Final flush of any remaining buffered entries
                 self.flush_buffer()?;
@@ -1258,6 +1297,11 @@ impl Scanner {
             total_dirs.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Store calculated stats for progress updates during final flush
+        self.calculated_total_size.store(total_size.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_files.store(total_files.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.calculated_total_dirs.store(total_dirs.load(Ordering::Relaxed), Ordering::Relaxed);
+
         // Final flush
         self.flush_buffer()?;
 
@@ -1304,7 +1348,7 @@ impl Scanner {
                 let _ = progress_tx.send(ProgressUpdate {
                     files_scanned: count,
                     dirs_scanned: 0, // Will be updated from atomics if needed
-                    total_size: 0,   // Will be updated from atomics if needed
+                    total_size: self.calculated_total_size.load(Ordering::Relaxed),
                     current_path: entry.path.display().to_string(),
                     active_dirs: active_dirs_snapshot,
                     active_workers: self.active_workers.load(Ordering::Relaxed),

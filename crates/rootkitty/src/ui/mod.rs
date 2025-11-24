@@ -122,8 +122,8 @@ pub struct App {
 
 impl App {
     pub fn new(db: Database, settings: Settings, settings_path: PathBuf, db_path: PathBuf) -> Self {
-        let mut scan_list_state = ListState::default();
-        scan_list_state.select(Some(0));
+        let scan_list_state = ListState::default();
+        // Don't set initial selection - let load_scans() handle it after tree is built
 
         Self {
             db,
@@ -2151,26 +2151,82 @@ impl App {
         let mut lines = vec![Line::from("")];
 
         if let Some(scan_id) = self.delete_scan_id {
-            // Find the scan in the list to show its path
-            let scan_path = self
-                .scans
-                .iter()
-                .find(|s| s.id == scan_id)
-                .map(|s| s.root_path.as_str())
-                .unwrap_or("unknown");
+            // Find the scan in the list to show its details
+            if let Some(scan) = self.scans.iter().find(|s| s.id == scan_id) {
+                lines.push(Line::from(vec![Span::styled(
+                    "Delete Scan?",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )]));
+                lines.push(Line::from(""));
 
-            lines.push(Line::from(vec![Span::styled(
-                "Delete Scan?",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )]));
-            lines.push(Line::from(""));
-            lines.push(Line::from(format!("Scan ID: {}", scan_id)));
-            lines.push(Line::from(format!("Path: {}", scan_path)));
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled(
-                "This will permanently delete all scan data.",
-                Style::default().fg(Color::Yellow),
-            )]));
+                // Show scan details
+                lines.push(Line::from(vec![
+                    Span::styled("Path: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&scan.root_path, Style::default().fg(Color::White)),
+                ]));
+                lines.push(Line::from(""));
+
+                // Stats header
+                lines.push(Line::from(vec![Span::styled(
+                    "Scan Statistics:",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )]));
+
+                // Files and directories
+                lines.push(Line::from(vec![
+                    Span::styled("  Files:       ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", scan.total_files),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("  Directories: ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", scan.total_dirs),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+
+                // Total size
+                let size_str = format_size(scan.total_size as u64);
+                lines.push(Line::from(vec![
+                    Span::styled("  Total size:  ", Style::default().fg(Color::Gray)),
+                    Span::styled(size_str, Style::default().fg(Color::White)),
+                ]));
+
+                // Scan date
+                let scan_date = scan.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
+                lines.push(Line::from(vec![
+                    Span::styled("  Scanned:     ", Style::default().fg(Color::Gray)),
+                    Span::styled(scan_date, Style::default().fg(Color::White)),
+                ]));
+
+                // Status
+                let status_color = match scan.status.as_str() {
+                    "completed" => Color::Green,
+                    "paused" => Color::Yellow,
+                    "scanning" => Color::Blue,
+                    _ => Color::Gray,
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  Status:      ", Style::default().fg(Color::Gray)),
+                    Span::styled(&scan.status, Style::default().fg(status_color)),
+                ]));
+
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    "⚠ This will permanently delete all scan data and reclaim disk space.",
+                    Style::default().fg(Color::Yellow),
+                )]));
+            } else {
+                // Scan not found
+                lines.push(Line::from(vec![Span::styled(
+                    "Error: Scan not found",
+                    Style::default().fg(Color::Red),
+                )]));
+            }
+
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "Press Y to confirm deletion, N/Esc to cancel",
@@ -2207,19 +2263,42 @@ impl App {
         ];
 
         if let Some(scan_id) = self.delete_scan_id {
-            // Find the scan in the list to show its path
-            let scan_path = self
-                .scans
-                .iter()
-                .find(|s| s.id == scan_id)
-                .map(|s| s.root_path.as_str())
-                .unwrap_or("unknown");
+            // Find the scan in the list to show its details
+            if let Some(scan) = self.scans.iter().find(|s| s.id == scan_id) {
+                lines.push(Line::from(vec![
+                    Span::styled("Path: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&scan.root_path, Style::default().fg(Color::White)),
+                ]));
+                lines.push(Line::from(""));
 
-            lines.push(Line::from(format!("Scan ID: {}", scan_id)));
-            lines.push(Line::from(format!("Path: {}", scan_path)));
-            lines.push(Line::from(""));
+                // Show what's being deleted
+                lines.push(Line::from(vec![
+                    Span::styled("Deleting ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", scan.total_files),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(" files, ", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format!("{}", scan.total_dirs),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(" directories (", Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        format_size(scan.total_size as u64),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(")", Style::default().fg(Color::Gray)),
+                ]));
+                lines.push(Line::from(""));
+            }
+
             lines.push(Line::from(vec![Span::styled(
-                "Removing scan data from database...",
+                "• Removing scan data from database...",
+                Style::default().fg(Color::Gray),
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "• Running VACUUM to reclaim disk space...",
                 Style::default().fg(Color::Gray),
             )]));
         }
@@ -2641,8 +2720,21 @@ impl App {
         // Rebuild the scan tree
         self.rebuild_scan_tree();
 
-        if !self.scans.is_empty() && self.scan_list_state.selected().is_none() {
-            self.scan_list_state.select(Some(0));
+        // Maintain invariant: selection always points to a valid node or None
+        // Check if current selection is still valid (in bounds)
+        if !self.flat_scan_tree.is_empty() {
+            match self.scan_list_state.selected() {
+                Some(idx) if idx < self.flat_scan_tree.len() => {
+                    // Selection is valid, keep it
+                }
+                _ => {
+                    // Selection is invalid or None, select first visible node
+                    self.scan_list_state.select(Some(0));
+                }
+            }
+        } else {
+            // No nodes, clear selection
+            self.scan_list_state.select(None);
         }
         Ok(())
     }
@@ -3468,6 +3560,15 @@ impl App {
 
                 // Rebuild the flat tree to reflect the change
                 self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
+
+                // Keep selection at same index if possible, otherwise clamp
+                if selected_index >= self.flat_scan_tree.len() {
+                    if !self.flat_scan_tree.is_empty() {
+                        self.scan_list_state.select(Some(self.flat_scan_tree.len() - 1));
+                    } else {
+                        self.scan_list_state.select(None);
+                    }
+                }
             }
         }
     }
@@ -3483,6 +3584,8 @@ impl App {
 
                 // Rebuild the flat tree to reflect the change
                 self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
+
+                // Selection stays at same index (which now might show different content)
             }
         }
     }
@@ -3491,6 +3594,7 @@ impl App {
     fn unfold_all_scan_tree(&mut self) {
         scan_tree::unfold_all(&mut self.scan_tree);
         self.flat_scan_tree = scan_tree::flatten_tree(&self.scan_tree);
+        // Selection stays at current index
     }
 
     /// Get the display path for a scan, clipping the parent path if the scan is nested
