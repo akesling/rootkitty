@@ -403,6 +403,7 @@ impl App {
                                         // Exit treemap mode or go up one level
                                         if self.treemap_path.is_empty() {
                                             // Already at root, exit treemap mode
+                                            self.sync_treemap_to_file_tree();
                                             self.treemap_mode = false;
                                             self.status_message = "Exited treemap mode".to_string();
                                         } else {
@@ -434,6 +435,7 @@ impl App {
                                     }
                                     KeyCode::Char('T') => {
                                         // Toggle treemap mode off
+                                        self.sync_treemap_to_file_tree();
                                         self.treemap_mode = false;
                                         self.status_message = "Exited treemap mode".to_string();
                                         self.g_pressed = false;
@@ -511,7 +513,7 @@ impl App {
                                                     self.detail_file = Some(entry.clone());
                                                     self.previous_view = View::FileTree;
                                                     self.view = View::FileDetail;
-                                                    self.treemap_mode = false; // Exit treemap mode
+                                                    // Keep treemap_mode as-is so user can toggle with Shift+T
                                                 }
                                             }
                                         }
@@ -683,6 +685,8 @@ impl App {
                                                     "Treemap mode enabled".to_string();
                                             }
                                         } else {
+                                            // Exiting treemap mode - sync selection to file tree
+                                            self.sync_treemap_to_file_tree();
                                             self.status_message =
                                                 "Treemap mode disabled".to_string();
                                         }
@@ -1188,9 +1192,19 @@ impl App {
                         View::FileDetail => match key.code {
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Esc => {
-                                // Go back to file tree
+                                // Go back to file tree (will show treemap if treemap_mode is true)
                                 self.view = View::FileTree;
                                 self.detail_file = None;
+                                self.g_pressed = false;
+                            }
+                            KeyCode::Char('T') => {
+                                // Shift+T - toggle treemap mode (takes effect when returning to file tree)
+                                self.treemap_mode = !self.treemap_mode;
+                                self.status_message = if self.treemap_mode {
+                                    "Treemap mode enabled (press Esc to return)".to_string()
+                                } else {
+                                    "Treemap mode disabled (press Esc to return)".to_string()
+                                };
                                 self.g_pressed = false;
                             }
                             _ => {
@@ -3049,6 +3063,57 @@ impl App {
         let current = self.get_treemap_selection().unwrap_or(0);
         let new_idx = current.saturating_sub(page_size);
         self.set_treemap_selection(new_idx);
+    }
+
+    /// Sync file tree selection to match current treemap selection
+    fn sync_treemap_to_file_tree(&mut self) {
+        let treemap_entries = self.get_treemap_entries();
+        if let Some(selected_idx) = self.get_treemap_selection() {
+            if let Some(selected_entry) = treemap_entries.get(selected_idx) {
+                // Try to find this entry in the visible file tree
+                let visible = self.get_visible_entries();
+                if let Some(file_tree_idx) =
+                    visible.iter().position(|e| e.path == selected_entry.path)
+                {
+                    // Found it in visible entries, select it
+                    self.file_list_state.select(Some(file_tree_idx));
+                } else {
+                    // Entry not visible (likely folded), try to unfold ancestors and find it
+                    // First, ensure the entry is loaded in memory
+                    if self
+                        .file_entries
+                        .iter()
+                        .any(|e| e.path == selected_entry.path)
+                    {
+                        // Unfold all ancestor directories
+                        let mut ancestor_path = selected_entry.parent_path.clone();
+                        while let Some(ref parent) = ancestor_path {
+                            if !parent.is_empty() {
+                                // Remove from folded set to unfold
+                                self.folded_dirs.remove(parent);
+
+                                // Move to next ancestor
+                                ancestor_path = self
+                                    .file_entries
+                                    .iter()
+                                    .find(|e| e.path == *parent)
+                                    .and_then(|e| e.parent_path.clone());
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // Now try to find it again in visible entries
+                        let visible = self.get_visible_entries();
+                        if let Some(file_tree_idx) =
+                            visible.iter().position(|e| e.path == selected_entry.path)
+                        {
+                            self.file_list_state.select(Some(file_tree_idx));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn ensure_children_loaded(&mut self, dir_path: &str) -> Result<()> {
